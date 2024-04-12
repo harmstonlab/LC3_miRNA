@@ -1,0 +1,7 @@
+sample_id	sample	condition
+GFP-KO-1	1	GFP_KO
+GFP-KO-2	2	GFP_KO
+Atg7-KO-1	1	Atg7_KO
+Atg7-KO-2	2	Atg7_KO
+Atg14-KO-1	1	Atg14_KO
+Atg14-KO-2	2	Atg14_KO

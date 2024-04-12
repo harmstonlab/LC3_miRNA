@@ -1,0 +1,588 @@
+---
+title: "miRNA-seq Analysis"
+author: "Sara Haghani / Nathan Harmston"
+date: "12/10/2021"
+output: html_document
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+
+```{r global_options, include=FALSE}
+short=FALSE 
+knitr::opts_chunk$set(echo = TRUE)
+#if short==TRUE, do not echo code chunks -- code folding doesn't work if short == TRUE
+debug=FALSE
+knitr::opts_chunk$set(fig.width=12, fig.height=8, fig.path='./figures/',
+                      echo=!short, warning=debug, message=debug, dev=c("png", "cairo_pdf"))
+```
+
+
+
+
+### Loading libraries 
+```{r load libraries}
+library(DESeq2)
+library(stringr)
+library(ggplot2)
+library(biomaRt)
+library(GenomicFeatures)
+library(dplyr)
+library(DT)
+library(pheatmap)
+library(clusterProfiler)
+library("org.Mm.eg.db")
+library(dplyr)
+library(tidyr)
+library(reshape)
+```
+
+
+
+```{r}
+mm.gtf.db <- makeTxDbFromGFF("../talbert_et_al/annotation/Mus_musculus.GRCm38.102.chr.gtf", format="gtf" )
+ensembl.genes = genes(mm.gtf.db)
+
+mouse = useEnsembl(biomart="ENSEMBL_MART_ENSEMBL", dataset="mmusculus_gene_ensembl", version = "102")
+bm.annotations = getBM(attributes=c("ensembl_gene_id", "entrezgene_id", "gene_biotype", "mgi_symbol", "description", "external_gene_name"), mart=mouse, filters="ensembl_gene_id", values=ensembl.genes$gene_id, uniqueRows=TRUE)
+
+ensembl.genes$external_gene_name = bm.annotations$external_gene_name[ match(ensembl.genes$gene_id, bm.annotations$ensembl_gene_id) ]
+ensembl.genes$gene_biotype = bm.annotations$gene_biotype[ match(ensembl.genes$gene_id, bm.annotations$ensembl_gene_id) ]
+ensembl.genes$mgi_symbol = bm.annotations$mgi_symbol[ match(ensembl.genes$gene_id, bm.annotations$ensembl_gene_id) ]
+ensembl.genes$description = bm.annotations$description[ match(ensembl.genes$gene_id, bm.annotations$ensembl_gene_id) ]
+ensembl.genes$entrezgene_id = bm.annotations$entrezgene_id[ match(ensembl.genes$gene_id, bm.annotations$ensembl_gene_id) ]
+```
+
+
+### Tidy the genes info df
+```{r}
+# library(dplyr)
+# library(tidyr)
+# library(stringr)
+# mmu.gff = read.delim("mmu.gff3", header = FALSE, sep = "\t")
+
+#generate necessary column names
+# colmn <- paste("col", 1:4)
+
+# mmu.gff <-
+#   tidyr::separate(
+#     data = mmu.gff,
+#     col = V9,
+#     sep = ";",
+#     into = colmn,
+#     remove = TRUE
+#   )
+# mmu.gff = mmu.gff[,-c(2,6,8)]
+# colnames(mmu.gff) = c("Chromosome","Type","Start","End","Strand","ID", "Alias","Name","Derivation")
+# mmu.gff$ID <- gsub("ID=","",mmu.gff$ID)
+# mmu.gff$Alias <- gsub("Alias=","",mmu.gff$Alias)
+# mmu.gff$Name <- gsub("Name=","",mmu.gff$Name)
+# mmu.gff$Derivation <- gsub("Derives_from=","",mmu.gff$Derivation)
+#write.csv(mmu.gff,"mmu_gff.csv")
+mmu.gff = read.csv("annotation/mmu_gff.csv", header = TRUE, sep = ",")
+```
+
+
+
+### Loading the datasets
+```{r cache=TRUE}
+experimental_metadata = read.delim("set1.txt", sep="\t", header=TRUE, stringsAsFactors=FALSE)
+
+#Create a matrix of the data (nrow can be obtained by calling wc -l RDW00X.genes.results in terminal; note -1 for header)
+data = matrix(0, ncol=length(experimental_metadata$sample_id), nrow=2110)
+colnames(data)= experimental_metadata$sample_id
+
+for( i in experimental_metadata$sample_id){
+  data[,i] = read.table(paste("./counts/", i, ".txt",sep=""), sep="\t", header=TRUE)$Count
+}
+row.names(data) = read.table(paste("./counts/", i, ".txt",sep=""), sep="\t", header=TRUE)$Geneid
+
+tmp = sapply(str_split(row.names(data), "\\_"), function(x){x[[1]][1]})
+row.names(table(tmp)[table(tmp) > 1])
+
+# Split and remove the trailing _1 and _2
+data_df <- as.data.frame(data)
+data_df$ID <- rownames(data_df)
+data_df <- data_df  %>% 
+    as_tibble()  %>% 
+    dplyr::select(ID, everything()) %>% 
+    separate(ID, sep = "_", into = c("ID", "sub"))
+head(data_df)
+
+sum(duplicated(data_df$ID))
+
+# Merge counts for MIMATs with same ID
+data_df_merged <- data_df  %>% 
+    dplyr::select(-c(sub))  %>% 
+    group_by(ID)  %>% 
+    summarize(`GFP-KO-1` = sum(`GFP-KO-1`),
+          `GFP-KO-2` = sum(`GFP-KO-2`),
+           `Atg7-KO-1` = sum(`Atg7-KO-1`), 
+          `Atg7-KO-2` = sum(`Atg7-KO-2`),
+          `Atg14-KO-1` = sum(`Atg14-KO-1`), 
+          `Atg14-KO-2` = sum(`Atg14-KO-2`)
+          )
+data_mat <- as.matrix(data_df_merged[, -1 ])
+rownames(data_mat) <- data_df_merged$ID
+
+experimental_metadata$condition = factor(experimental_metadata$condition, levels=c("GFP_KO", "Atg14_KO", "Atg7_KO"))
+
+data_mat = data_mat[rowSums(data_mat) > 0,]
+dds = DESeqDataSetFromMatrix(data_mat, experimental_metadata, ~ condition)
+colnames(dds) = colnames(data_mat)
+
+dds <- estimateSizeFactors(dds) 
+dds <- estimateDispersions(dds)
+rld <- rlog(dds)
+```
+
+
+### Sample clustering
+```{r hclust}
+sampleDists <- dist(t(assay(rld)))
+plot(hclust(sampleDists))
+```
+
+
+### PCA
+- PC1 = condition 
+- PC2 = KO
+```{r pca_samples}
+ntop = 500
+rv <- rowVars(assay(rld))
+select <- order(rv, decreasing = TRUE)[seq_len(min(ntop, length(rv)))]
+pca = prcomp(t(assay(rld)[select,]))
+percentVar <- pca$sdev^2/sum(pca$sdev^2)
+
+pca_data <- plotPCA(rld, intgroup = c("condition"), returnData=TRUE)
+percentVar <- round(100 * attr(pca_data, "percentVar"), digits=2)
+ggplot(pca_data, aes(PC1, PC2, color=condition)) + geom_point(size=2) +
+  scale_x_continuous(paste0("PC1: ",percentVar[1],"% variance"), limits=c(-16, 16), breaks=c(-15, -10, -5, 0, 5, 10, 15)) +
+  scale_y_continuous(paste0("PC2: ",percentVar[2],"% variance"), limits=c(-9, 9), breaks=c(-8, -4, 0, 4, 8)) + 
+  coord_fixed() + theme_classic() + geom_text(data = pca_data, aes(PC1,PC2, label = name), hjust = 1.1)
+```
+
+### Number of Genes Detected
+
+About 30%-40% of miRNA genes have detectable expression  
+
+```{r number_of_genes}
+detected = apply(counts(dds), 2, function(col) sum(col > 0 ))
+detected = as.data.frame(detected)
+detected$name = row.names(detected)
+detected$name = factor(detected$name, experimental_metadata$sample_id)
+ggplot(detected, aes(x=name, y=detected)) + geom_bar(stat="identity") + theme_classic() + coord_flip() + scale_y_continuous("# miRNAs detected", expand=c(0,0)) + scale_x_discrete("Sample")
+
+detected$detected / nrow(mmu.gff[mmu.gff$Type == "miRNA",]) * 100
+```
+
+### Size Factors
+
+```{r size_factors}
+print(sizeFactors(dds))
+df = data.frame(sample_id = names(sizeFactors(dds)), sizeFactors = sizeFactors(dds))
+
+ggplot(df, aes(x = sample_id, y=sizeFactors)) + geom_bar(stat="identity") + scale_y_continuous(limits=c(0,3), expand=c(0,0)) + theme_classic() + theme(axis.text.x = element_text(angle = 45, hjust=1, colour="black", family="Arial", size=12))
+```
+
+### Filtering out genes with low read counts 
+
+lots of lowly expressed miRNAs - filter them out prior to differential expression analysis
+
+```{r}
+filter = apply(counts(dds, normalized=TRUE), 1, function(x){ mean(x) >= 10 }) 
+dds = dds[filter, ]
+dds = estimateSizeFactors(dds)
+dds = estimateDispersions(dds)
+rld = rlog(dds)
+```
+
+
+### Likelihood Ratio Test and Pairwise Comparisons (Wald)
+
+```{r}
+dds = nbinomLRT(dds, full = ~condition, reduced = ~1)
+dds.results = results(dds)
+```
+
+### Add mi-RNA information to the main dataframe 
+```{r}
+dds.results.df = as.data.frame(dds.results)
+#colnames(dds.results.df) = c("ANOVA.pvalue","ANOVA.padj")
+dds.results.df = dds.results.df[,c(-1:-4)]
+dds.results.df$Name = mmu.gff$Name[match(rownames(dds.results.df),mmu.gff$ID)]
+
+dds.results.df$Chromosome = mmu.gff$Chromosome[match(rownames(dds.results.df),mmu.gff$ID)]
+dds.results.df$Type = mmu.gff$Type[match(rownames(dds.results.df),mmu.gff$ID)]
+dds.results.df$Start = mmu.gff$Start[match(rownames(dds.results.df),mmu.gff$ID)]
+dds.results.df$End = mmu.gff$End[match(rownames(dds.results.df),mmu.gff$ID)]
+dds.results.df$Strand = mmu.gff$Strand[match(rownames(dds.results.df),mmu.gff$ID)]
+dds.results.df$Alias = mmu.gff$Alias[match(rownames(dds.results.df),mmu.gff$ID)]
+dds.results.df$Derivation = mmu.gff$Derivation[match(rownames(dds.results.df),mmu.gff$ID)]
+```
+
+```{r}
+##Include pairwise p-value, FDR, and LFC 
+
+############# ATG7 vs GFP ################
+atg7.vs.gfp = results(dds, contrast = c("condition", "Atg7_KO", "GFP_KO"), test = "Wald")
+atg7.vs.gfp <- lfcShrink(dds,
+    coef = "condition_Atg7_KO_vs_GFP_KO", res=atg7.vs.gfp, type = 'ashr')
+
+dds.results.df$ATG7.vs.GFP_LFC = atg7.vs.gfp$log2FoldChange[match(rownames(dds.results.df), rownames(atg7.vs.gfp))]
+dds.results.df$ATG7.vs.GFP_pvalue = atg7.vs.gfp$pvalue[match(rownames(dds.results.df), rownames(atg7.vs.gfp))]
+dds.results.df$ATG7.vs.GFP_FDR = atg7.vs.gfp$padj[match(rownames(dds.results.df), rownames(atg7.vs.gfp))]
+
+############# ATG14 vs GFP ################
+atg14.vs.gfp = results(dds, contrast = c("condition", "Atg14_KO", "GFP_KO"), test = "Wald")
+atg14.vs.gfp <- lfcShrink(dds,
+    coef = "condition_Atg14_KO_vs_GFP_KO", res=atg14.vs.gfp, type = 'ashr')
+
+dds.results.df$ATG14.vs.GFP_LFC = atg14.vs.gfp$log2FoldChange[match(rownames(dds.results.df), rownames(atg14.vs.gfp))]
+dds.results.df$ATG14.vs.GFP_pvalue = atg14.vs.gfp$pvalue[match(rownames(dds.results.df), rownames(atg14.vs.gfp))]
+dds.results.df$ATG14.vs.GFP_FDR = atg14.vs.gfp$padj[match(rownames(dds.results.df), rownames(atg14.vs.gfp))]
+
+############# ATG7 vs ATG14 ################
+atg7.vs.atg14 = results(dds, contrast = c("condition", "Atg7_KO", "Atg14_KO"), test = "Wald")
+atg7.vs.atg14 <- lfcShrink(dds,
+    contrast =  c("condition", "Atg7_KO", "Atg14_KO"), res=atg7.vs.atg14, type = 'ashr')
+# Add relevant columns to dds.results.df 
+dds.results.df$ATG7.vs.ATG14_LFC = atg7.vs.atg14$log2FoldChange[match(rownames(dds.results.df), rownames(atg7.vs.atg14))]
+dds.results.df$ATG7.vs.ATG14_pvalue = atg7.vs.atg14$pvalue[match(rownames(dds.results.df), rownames(atg7.vs.atg14))]
+dds.results.df$ATG7.vs.ATG14_FDR = atg7.vs.atg14$padj[match(rownames(dds.results.df), rownames(atg7.vs.atg14))]
+```
+
+### Re-order dataframe
+```{r}
+dds.results.df = dds.results.df[,c(3:10, 1:2,11:19)]  
+```
+
+
+### Significant results (FDR < 10%) 
+
+
+
+```{r}
+signif.results = dds.results.df[dds.results.df$padj < 0.1,]
+```
+
+`r nrow(signif.results)` genes (ANOVA FDR < 10%)
+
+### Visualize the results
+
+
+```{r}
+rld_signif = assay(rld)[rownames(signif.results),]
+rld_z = t(apply(rld_signif, 1, function(x){ (x - mean(x)) / sd(x)}))
+```
+
+### Determine the number of clusters
+
+```{r}
+k.max <- 15
+wss <- sapply(2:k.max,
+ function(k){kmeans(rld_z, k, nstart=100,
+ iter.max = 20 )$tot.withinss})
+plot(2:k.max, wss,
+ type="b", pch = 19, frame = FALSE,
+ xlab="Number of clusters K",
+ ylab="Total within-clusters sum of squares")
+```
+
+
+### Cluster 
+
+
+```{r}
+set.seed(2)
+nclust = 4
+results.coef.kmeans = kmeans(rld_z, nclust, iter.max=50)
+#results.coef.kmeans = readRDS("results_kmeans.rds")
+breaksList = seq(-3, 3, length.out = 29)
+
+cs = results.coef.kmeans$cluster
+cs <- factor(cs, levels = c(4, 3, 1, 2))
+
+
+z.toplot = rld_z[order(cs),c("GFP-KO-1", "GFP-KO-2", "Atg14-KO-1",  "Atg14-KO-2", "Atg7-KO-1", "Atg7-KO-2")]
+
+
+table(results.coef.kmeans$cluster)
+color = c(colorRampPalette(c("mediumblue", "white"))(14),
+colorRampPalette(c("white", "firebrick2"))(14))
+heat.map <- pheatmap(z.toplot, cluster_col=FALSE,
+                     breaks=breaksList, cluster_rows=FALSE,
+                     show_rownames=FALSE,color = color,
+                     fontsize_row = 3, legend=TRUE,
+                     border_color = NA, 
+                     annotation_row=data.frame(cluster=cs))
+```
+
+Add 'cluster' column to the dataframe of genes
+
+```{r}
+cluster.df = as.data.frame(results.coef.kmeans[["cluster"]])
+colnames(cluster.df) = "cluster"
+cluster.df$cluster = ifelse(results.coef.kmeans$cluster==4, 1,
+       ifelse(results.coef.kmeans$cluster==3, 2, 
+              ifelse(results.coef.kmeans$cluster==1, 3, 4)))
+
+dds.results.df$cluster = cluster.df$cluster[match(rownames(dds.results.df), rownames(cluster.df))]
+write.csv(dds.results.df, "results/set1_mirna_df.csv")
+```
+
+
+# Targetscan - 
+
+
+```{r, eval=FALSE}
+library(stringr)
+targetscan = read.delim("./mmu80_Conserved_Site_Context_Scores.txt", sep="\t")
+targetscan = targetscan %>% mutate(ensembl_gene_id = sapply(str_split(Gene.ID, "\\."), function(x){x[1]} ))
+targetscan = targetscan %>% filter(miRNA %in% dds.results.df$Name)
+c4.targets = targetscan[targetscan$miRNA %in% dds.results.df$Name[!is.na(dds.results.df$cluster) & dds.results.df$cluster==4], ]
+
+targetscan = read.delim("./mmu80_Nonconserved_Site_Context_Scores.txt", sep="\t")
+targetscan = targetscan %>% mutate(ensembl_gene_id = sapply(str_split(Gene.ID, "\\."), function(x){x[1]} ))
+targetscan = targetscan %>% filter(miRNA %in% dds.results.df$Name)
+c4.nonconserved.targets = targetscan[targetscan$miRNA %in% dds.results.df$Name[!is.na(dds.results.df$cluster) & dds.results.df$cluster==4], ]
+
+c4.targets$set = "conserved"
+c4.nonconserved.targets$set = "nonconserved"
+
+all.c4.targets = rbind(c4.targets, c4.nonconserved.targets)
+write.csv(all.c4.targets, "./results/c4_conserved_and_nonconserved_targets.csv")
+```
+
+# Merge with miRNA differential expression and Talbert et al differential expression
+
+```{r}
+talbert_results = read.delim("../talbert_et_al/results/talbert_mouse_df.csv", sep=",")
+colnames(talbert_results)[1] = "ensembl_gene_id"
+all.c4.targets = read.csv("./results/c4_conserved_and_nonconserved_targets.csv")
+
+length(unique(all.c4.targets$Gene.ID))
+
+c4.all.targets = merge(dds.results.df[!is.na(dds.results.df$cluster) & dds.results.df$cluster==4,], all.c4.targets,
+                   by.x="Name", by.y="miRNA",
+                   all.x=TRUE)
+
+c4.all.targets = merge(c4.all.targets, talbert_results[,c("ensembl_gene_id", "log2FoldChange", "pvalue", "padj", "mgi_symbol", "description")], by="ensembl_gene_id", all.x=TRUE, suffixes = c(".x", ".talbert"))
+```
+
+
+```{r}
+c4_dn = unique(c4.all.targets[!is.na(c4.all.targets$padj.talbert) & c4.all.targets$padj.talbert< 0.1 & c4.all.targets$log2FoldChange < -log2(1.5),]$ensembl_gene_id)
+
+ego.BP_c4 <- enrichGO(gene          = c4_dn,
+                universe      = talbert_results$ensembl_gene_id, 
+                OrgDb         = org.Mm.eg.db,  
+                keyType       = 'ENSEMBL',  
+                ont           = "BP", 
+                pAdjustMethod = "BH", 
+                pvalueCutoff  = 1,
+                qvalueCutoff  = 1,
+                readable      = TRUE)
+
+
+write.csv(as.data.frame(ego.BP_c4), "./results/set1_c4_dn_conserved_and_nonconserved_targets_bp.csv")
+
+dotplot(ego.BP_c4, title="GO:BP C4 conserved and nonconserved miR and downregulated in Talbert")
+
+ego.CC_c4 <- enrichGO(gene    = c4_dn,
+                universe      = talbert_results$ensembl_gene_id,
+                OrgDb         = org.Mm.eg.db,  
+                keyType       = 'ENSEMBL',  
+                ont           = "CC", 
+                pAdjustMethod = "BH", 
+                pvalueCutoff  = 1,
+                qvalueCutoff  = 1,
+                readable      = TRUE)
+
+write.csv(as.data.frame(ego.CC_c4), "./results/set1_c4_dn_conserved_nonconserved_targets_cc.csv")
+
+dotplot(ego.CC_c4, title="GO:CC C4 conserved and nonconserved miR and downregulated in Talbert")
+
+
+ego.MF_c4 <- enrichGO(gene    = c4_dn,
+                universe      = talbert_results$ensembl_gene_id,
+                OrgDb         = org.Mm.eg.db,  
+                keyType       = 'ENSEMBL',  
+                ont           = "MF", 
+                pAdjustMethod = "BH", 
+                pvalueCutoff  = 1,
+                qvalueCutoff  = 1,
+                readable      = TRUE)
+
+write.csv(as.data.frame(ego.MF_c4), "./results/set1_c4_dn_conserved_nonconserved_targets_mf.csv")
+
+dotplot(ego.MF_c4, title="GO:MF C4 conserved and nonconserved miR and downregulated in Talbert")
+
+
+kegg_c4 <- enrichKEGG( gene= as.character(ensembl.genes[c4_dn,]$entrezgene_id),
+                      universe = as.character(ensembl.genes[talbert_results$ensembl_gene_id,]$entrezgene_id),
+                      organism = 'mmu' ,
+                      pvalueCutoff=1,
+                      qvalueCutoff =1)
+
+kegg_c4.df = as.data.frame(kegg_c4)
+kegg_c4.df$geneID = sapply(kegg_c4.df$geneID, function(x){
+return(paste(bm.annotations$mgi_symbol[bm.annotations$entrezgene %in% str_split(x, "/")[[1]]], collapse=","))})
+
+
+write.csv(kegg_c4.df, "./results/set1_c4_dn_conserved_nonconserved_targets_kegg.csv")
+saveRDS(kegg_c4, "rds/KEGG_dn.rds")
+dotplot(kegg_c4, title= "KEGG C4 conserved and nonconserved miR and downregulated in Talbert")
+
+```
+
+
+```{r}
+down.terms = rbind(
+  ego.BP_c4[ego.BP_c4$Description %in% c("skeletal system development",
+ "collagen fibril organization","tricarboxylic acid cycle"),c("ID", "Description", "GeneRatio", "BgRatio", "pvalue", "p.adjust", "qvalue")], 
+  ego.CC_c4[ego.CC_c4$Description %in% c( "myofibril", "sarcomere",  "respirasome" ),c("ID", "Description", "GeneRatio", "BgRatio", "pvalue", "p.adjust", "qvalue")],
+  kegg_c4[kegg_c4$Description %in% c( "Protein digestion and absorption - Mus musculus (house mouse)", "Oxidative phosphorylation - Mus musculus (house mouse)",  "Cardiac muscle contraction - Mus musculus (house mouse)", "Focal adhesion - Mus musculus (house mouse)"),c("ID", "Description", "GeneRatio", "BgRatio", "pvalue", "p.adjust", "qvalue")])
+
+down.terms$ontology = c(rep("GO:BP", 3), rep("GO:CC", 3), rep("KEGG", 4))
+down.terms$count = sapply(str_split(down.terms$GeneRatio, "/"), function(x){ as.numeric(x[1])})
+down.terms$gr = sapply(str_split(down.terms$GeneRatio, "/"), function(x){ as.numeric(x[1])/as.numeric(x[2])})
+down.terms$bgr = sapply(str_split(down.terms$BgRatio, "/"), function(x){ as.numeric(x[1])/as.numeric(x[2])})
+down.terms$bg = sapply(str_split(down.terms$BgRatio, "/"), function(x){ as.numeric(x[1])})
+down.terms$gb = down.terms$count / down.terms$bg
+down.terms$category = "DOWN"
+
+down.terms$Description = factor(down.terms$Description,
+                                   rev(c("skeletal system development",
+ "collagen fibril organization","tricarboxylic acid cycle", "myofibril", "sarcomere",  "respirasome", "Protein digestion and absorption - Mus musculus (house mouse)", "Oxidative phosphorylation - Mus musculus (house mouse)",  "Cardiac muscle contraction - Mus musculus (house mouse)", "Focal adhesion - Mus musculus (house mouse)")))
+ 
+ggplot(down.terms, aes(x=gb, y=Description, size=count, colour=qvalue)) + geom_point() + scale_x_continuous("Fraction of annotated genes", limits=c(0, 1)) + theme_bw() + scale_color_continuous(limits=c(0, 0.1), high="blue", low="red") + facet_grid(~category)
+```
+
+
+
+## mir-30a-3p gene expression plot {.tabset}
+
+```{r}
+
+genes_plot <- data.frame(
+  condition = dds$condition,
+  expression = counts(dds, normalized = TRUE)[c("MIMAT0000129"), ])
+
+genes_plot %>%
+  ggplot(aes(x = condition, y = expression, group = condition, fill=condition)) + 
+  geom_boxplot() +
+  #geom_text(aes(label=round(value,2)), vjust=-0.3, size=3.5) + 
+  xlab("Samples") +
+  ylab("Normalised Counts") +
+  theme_bw() +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank()) +
+  geom_point(data=genes_plot, aes(x=condition, y=expression, group=condition), size=2) + scale_y_continuous(limits=c(0, 2000))
+
+```
+
+
+## miR-19b-3p gene expression plot {.tabset}
+
+```{r, eval=FALSE}
+
+genes_plot <- data.frame(
+  condition = dds$condition,
+  expression = counts(dds, normalized = TRUE)[c("MIMAT0000513"), ])
+
+genes_plot %>%
+  ggplot(aes(x = condition, y = expression, group = condition, fill=condition)) + 
+  geom_boxplot() +
+  #geom_text(aes(label=round(value,2)), vjust=-0.3, size=3.5) + 
+  xlab("Samples") +
+  ylab("Normalised Counts") +
+  theme_bw() +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank()) +
+  geom_point(data=genes_plot, aes(x=condition, y=expression, group=condition), size=2) + scale_y_continuous(limits=c(15000, 50000))
+
+```
+
+## mmu-miR-218-5p gene expression plot {.tabset}
+
+```{r, eval=FALSE}
+
+genes_plot <- data.frame(
+  condition = dds$condition,
+  expression = counts(dds, normalized = TRUE)[c("MIMAT0000663"), ])
+
+genes_plot %>%
+  ggplot(aes(x = condition, y = expression, group = condition, fill=condition)) + 
+  geom_boxplot() +
+  #geom_text(aes(label=round(value,2)), vjust=-0.3, size=3.5) + 
+  xlab("Samples") +
+  ylab("Normalised Counts") +
+  theme_bw() +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank()) +
+  geom_point(data=genes_plot, aes(x=condition, y=expression, group=condition), size=2) + scale_y_continuous(limits=c(0, 10000))
+
+```
+
+```{r}
+
+number_mirna_targets = melt(table(c4.all.targets[!is.na(c4.all.targets$padj.talbert) & c4.all.targets$padj.talbert< 0.1 & c4.all.targets$log2FoldChange < -log2(1.5), ]$Name))
+
+number_mirna_targets$pc = 100 * ( number_mirna_targets$value / 624) 
+
+number_mirna_targets %>%
+  ggplot(aes( y = value)) + 
+  geom_boxplot() +
+  #geom_text(aes(label=round(value,2)), vjust=-0.3, size=3.5) + 
+  xlab("Samples") +
+  ylab("Number downregulated genes targeted") +
+  theme_bw() +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank()) +
+  geom_point(data=number_mirna_targets, aes(x=0, y=value), size=2) + scale_y_continuous(limits=c(0, 450))
+
+
+number_mirna_targets %>%
+  ggplot(aes( y = pc)) + 
+  geom_boxplot() +
+  #geom_text(aes(label=round(value,2)), vjust=-0.3, size=3.5) + 
+  xlab("Samples") +
+  ylab("% downregulated genes targeted") +
+  theme_bw() +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank()) +
+  geom_point(data=number_mirna_targets, aes(x=0, y=pc), size=2, col="red") + scale_y_continuous(limits=c(0, 100))
+
+
+mirna_targets_stats = c4.all.targets[!is.na(c4.all.targets$padj.talbert) & c4.all.targets$padj.talbert< 0.1 & c4.all.targets$log2FoldChange < -log2(1.5), c("Name", "Gene.Symbol", "context...score", "weighted.context...score", "log2FoldChange")]
+
+mirna_targets_stats$weighted.context...score=as.numeric(mirna_targets_stats$weighted.context...score)
+
+mirna_targets_stats %>%
+  ggplot(aes(x=Name, y = log2FoldChange, grp=Name)) + 
+  geom_boxplot(outlier.colour = NA) + theme_bw() + theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  geom_point(data=mirna_targets_stats, aes(x=Name, y=log2FoldChange), size=0.3, col="red") + scale_y_continuous(limits=c(-4, 0))
+
+mirna_targets_stats %>%
+  ggplot(aes(x=Name, y = weighted.context...score, grp=Name)) + 
+  geom_boxplot(outlier.colour = NA) + theme_bw() + theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  geom_point(data=mirna_targets_stats, aes(x=Name, y=weighted.context...score), size=0.3, col="red") + scale_y_continuous(limits=c(-1.75, 0))
+
+
+```
+
+
+```{r}
+sessionInfo()
+```
+                  
+                  
+                  
+                  
+                  
+                   
