@@ -1,0 +1,1327 @@
+---
+title: "Differential Expression with SV1 + SV2 + KPC Removal"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Loading in necessary packages 
+
+```{r}
+library(DESeq2)
+library(ggplot2)
+library(genefilter)
+library(GenomicFeatures)
+library(biomaRt)
+library(knitr)
+library(reshape2)
+library(scales)
+library(Biostrings)
+library(kableExtra)
+library(pheatmap)
+library(org.Mm.eg.db)
+library(clusterProfiler)
+library("RColorBrewer")
+```
+
+## Creating the Input + Gene annotations 
+```{r}
+#read in the ensembl.genes 
+
+mm.gtf.db <- makeTxDbFromGFF("annotation/Homo_sapiens.GRCh38.102.chr.gtf", format="gtf" )
+ensembl.genes = genes(mm.gtf.db)
+
+mouse = useEnsembl(biomart="ENSEMBL_MART_ENSEMBL", dataset="hsapiens_gene_ensembl", version = "102")
+
+bm.annotations = getBM(attributes=c("ensembl_gene_id", "entrezgene_id", "gene_biotype", "hgnc_symbol", "description", "external_gene_name"), mart=mouse, filters="ensembl_gene_id", values=ensembl.genes$gene_id, uniqueRows=TRUE)
+
+ensembl.genes$external_gene_name = bm.annotations$external_gene_name[ match(ensembl.genes$gene_id, bm.annotations$ensembl_gene_id) ]
+
+ensembl.genes$gene_biotype = bm.annotations$gene_biotype[ match(ensembl.genes$gene_id, bm.annotations$ensembl_gene_id) ]
+
+ensembl.genes$hgnc_symbol = bm.annotations$hgnc_symbol[ match(ensembl.genes$gene_id, bm.annotations$ensembl_gene_id) ]
+
+ensembl.genes$description = bm.annotations$description[ match(ensembl.genes$gene_id, bm.annotations$ensembl_gene_id) ]
+
+ensembl.genes$entrezgene_id = bm.annotations$entrezgene_id[ match(ensembl.genes$gene_id, bm.annotations$ensembl_gene_id) ]
+```
+
+## Creating dataset from the Experimental metadata 
+```{r}
+#read in the experimental metadata 
+
+experimental_metadata = data.frame(name=c("control_patient1", "control_patient2", "control_patient3", "control_patient4", "control_patient5", 
+                  "cachectic_patient1", "cachectic_patient2", "cachectic_patient3", "cachectic_patient4", "cachectic_patient5"),
+           file=c("control_patient1.genes.results", "control_patient2.genes.results", "control_patient3.genes.results", "control_patient4.genes.results", "control_patient5.genes.results", "cachectic_patient1.genes.results", "cachectic_patient2.genes.results", "cachectic_patient3.genes.results", "cachectic_patient4.genes.results", "cachectic_patient5.genes.results"),
+           condition=c(rep("control", 5), rep("cachectic", 5)),
+           geo=c("GSM3911258", "GSM3911259", "GSM3911260", "GSM3911261", "GSM3911262",
+                 "GSM3911263", "GSM3911264", "GSM3911265", "GSM3911265", "GSM3911267"))
+experimental_metadata = experimental_metadata[experimental_metadata$name != "cachectic_patient4",]
+
+#experimental_metadata = read.delim("GSE133523_experimental_metadata.txt", sep="\t")
+
+#deleting the row that has KPC cachectic replicate 2 
+
+#create matrix of data 
+data = matrix(0, ncol=length(experimental_metadata$name), nrow=60616)
+colnames(data)= experimental_metadata$name
+for( i in experimental_metadata$name){
+  data[,i] = read.table(paste("data/GSE133523/", i, ".genes.results",sep=""), sep="\t", header=TRUE)$expected_count
+}
+row.names(data) = read.table(paste("data/GSE133523/", i, ".genes.results",sep=""), sep="\t", header=TRUE)$gene_id
+
+#Create a factor for the condition column (Cachectic vs. Control) - by making it a factor you give it an order
+experimental_metadata$condition = factor(experimental_metadata$condition, levels=c("control", "cachectic"))
+
+data_mat = apply(round(data), c(1,2), as.integer)
+
+```
+
+```{r}
+data_mat = data_mat[!(row.names(data_mat) %in% ensembl.genes$gene_id[ensembl.genes$gene_biotype %in% c("rRNA", "snoRNA", "snRNA", "Mt_rRNA")]),]
+data_mat = data_mat[rowSums(data_mat) > 0,]
+```
+
+```{r}
+dds = DESeqDataSetFromMatrix(data_mat, experimental_metadata, ~  condition)
+
+dds <- estimateSizeFactors(dds) 
+dds <- estimateDispersions(dds)
+```
+
+```{r hclust}
+rld <- rlog(dds)
+sampleDists <- dist(t(assay(rld)))
+plot(hclust(sampleDists))
+```
+
+
+### Correlation Heatmap
+```{r}
+annot = dplyr::select(experimental_metadata, c(condition))
+row.names(annot) = experimental_metadata$name
+rld %>%
+  assay() %>%
+  cor() %>%
+  pheatmap(color = colorRampPalette(rev(brewer.pal(n = 7, name = "RdBu")))(100),
+           annotation = annot,
+           annotation_colors = list(
+                               condition = c(control = "blue", cachectic= "red")),
+           cluster_rows = TRUE,
+           cluster_cols = T,
+           cellwidth = 13,
+           cellheight = 13)
+```
+
+### PCA
+```{r pca_samples, results='hide'}
+ntop = 500
+rv <- rowVars(assay(rld))
+select <- order(rv, decreasing = TRUE)[seq_len(min(ntop, length(rv)))]
+pca = prcomp(t(assay(rld)[select,]))
+percentVar <- pca$sdev^2/sum(pca$sdev^2)
+
+pca_data <- plotPCA(rld, intgroup = c("condition"), returnData=TRUE)
+percentVar <- round(100 * attr(pca_data, "percentVar"), digits=2)
+ggplot(pca_data, aes(PC1, PC2, color=condition)) + geom_point(size=3) +
+  scale_x_continuous(paste0("PC1: ",percentVar[1],"% variance"), limits=c(-20, 20)) +
+  scale_y_continuous(paste0("PC2: ",percentVar[2],"% variance")) + 
+  coord_fixed() + theme_classic() + geom_text(data = pca_data, aes(PC1,PC2, label = name), hjust = 1.2)
+
+```
+
+
+## Differential Expression
+
+## Likelihood ratio test 
+
+```{r}
+
+dds = nbinomLRT(dds, full = ~ condition, reduced = ~1 )
+results.lrt=results(dds)
+
+rld= rlog(dds) 
+
+significant_results=results.lrt[!is.na(results.lrt$padj) & results.lrt$padj<0.1,] ##10% are false positives. 
+rld_signif = assay(rld)[rownames(significant_results),]
+
+nrow(rld_signif)
+
+
+plot(counts(dds, normalized=TRUE)["ENSG00000229807",],
+colSums(counts(dds, normalized=TRUE)[row.names(counts(dds, normalized=TRUE))%in% ensembl.genes[seqnames(ensembl.genes)=="chrY"]$gene_id,]))
+
+```
+
+## Pairwise comparisons
+
+
+##Wald-test
+Hypothesis testing: The first step in hypothesis testing is to set up a null hypothesis for each gene. In our case is, the null hypothesis is that there is no differential expression across the two sample groups (LFC == 0). Notice that we can do this without observing any data, because it is based on a thought experiment. Second, we use a statistical test to determine if based on the observed data, the null hypothesis is true. With DESeq2, the Wald test is the default used for hypothesis testing when comparing two groups. The Wald test is a test of hypothesis usually performed on parameters that have been estimated by maximum likelihood.
+```{r}
+#control is the base for comparison 
+cachectic_vs_contol = results(dds, contrast = c("condition", "cachectic", "control"), test="Wald")
+
+#look at how many are differentially expressed: 
+hist(cachectic_vs_contol$pvalue)
+```
+
+##Removing genes with low number of reads and recalculating dds
+The histogram seen above is of this particular shape because there are a lot of low count genes in the analysis. We need to remove them. 
+```{r}
+#finding out the threshold of low mean counts using summary 
+summary(cachectic_vs_contol)
+
+#filter
+filter = apply(counts(dds, normalized=TRUE),
+                    1, function(x){ mean(x) >= 2 })
+dds = dds[filter, ]
+
+#recalculating everything 
+dds <- estimateSizeFactors(dds) 
+dds <- estimateDispersions(dds)
+
+dds = nbinomLRT(dds, full= ~1 + cell_line + SV1 + SV2 + condition, reduced = ~ 1 + cell_line + SV1 + SV2)
+results.lrt = results(dds)
+cachectic_vs_contol = results(dds, contrast=c("condition", "cachectic", "control"), independentFiltering = TRUE, alpha=0.1)
+raptor_vs_luc <- lfcShrink(dds,
+    coef = "condition_cachectic_vs_control", res=cachectic_vs_contol, type = 'ashr')
+
+#### TODO HERE
+raptor_vs_luc.df = as.data.frame(raptor_vs_luc)
+raptor_vs_luc.df$mgi_symbol = bm.annotations$mgi_symbol[ match(row.names(raptor_vs_luc.df), bm.annotations$ensembl_gene_id) ]
+raptor_vs_luc.df$gene_biotype = bm.annotations$gene_biotype[ match(row.names(raptor_vs_luc.df), bm.annotations$ensembl_gene_id) ]
+raptor_vs_luc.df$description = bm.annotations$description[ match(row.names(raptor_vs_luc.df), bm.annotations$ensembl_gene_id) ]
+raptor_vs_luc.df$entrezgene_id = bm.annotations$entrezgene_id[ match(row.names(raptor_vs_luc.df), bm.annotations$ensembl_gene_id) ]
+
+write.csv(dds.results.df, "./results/talbert_mouse_df.csv")
+
+
+#replotting the histogram 
+hist(cachectic_vs_contol$pvalue)
+
+nrow(dds) #19093 genes remaining 
+```
+
+
+##Volcano plots
+Plotting volcano plots to visualise the differential expression 
+```{r}
+#volcano plots for differences between control and cachectic 
+par(mar=c(5,5,5,5), cex=1.0, cex.main=1.4, cex.axis=1.4, cex.lab=1.4)
+
+# Adjusted P values (FDR Q values)
+with(cachectic_vs_contol, plot(log2FoldChange, -log10(padj), pch=20, main="Volcano plot of control vs. cachectic", cex=1.0, xlab=bquote(~Log[2]~fold~change), ylab=bquote(~-log[10]~padj~value) ) )
+
+with(subset(cachectic_vs_contol, padj<0.1 & log2FoldChange> 1), points(log2FoldChange, -log10(padj), pch=20, col="red", cex=0.5))
+
+with(subset(cachectic_vs_contol, padj<0.1 & log2FoldChange< -1), points(log2FoldChange, -log10(padj), pch=20, col="blue", cex=0.5))
+
+
+#Add lines for absolute FC>2 and P-value cut-off at FDR Q<0.1
+abline(v=0, col="black", lty=3, lwd=1.0)
+abline(v=-1, col="black", lty=4, lwd=2.0)
+abline(v=1, col="black", lty=4, lwd=2.0)
+abline(h=-log10(0.1), col="black", lty=4, lwd=2.0)
+
+legend("right", legend=c("Upregulated", "Downregulated", "Not"),fill= c("red", "blue", "black"))
+```
+#Volcano plot with ggplot 
+```{r}
+
+# Create a simple volcano plot -------------------------------------------------
+library(dplyr)
+
+c.vs.c <- as.data.frame(cachectic_vs_contol)
+
+c.vs.c$external_gene_name = bm.annotations$external_gene_name[ match(rownames(c.vs.c), bm.annotations$ensembl_gene_id)]
+
+# Create new categorical column ------------------------------------------------ 
+c.vs.c <- c.vs.c %>%
+  mutate(gene_type = case_when(log2FoldChange > 0 & padj <0.1 ~ "upregulated",
+                               log2FoldChange < 0 & padj <0.1 ~ "downregulated",
+                               TRUE ~ "not"))   
+
+# Obtain gene_type counts ------------------------------------------------------           
+c.vs.c %>%
+  dplyr::count(gene_type)
+
+#adding colour 
+cols <- c("upregulated" = "firebrick2", "downregulated" = "blue", "not" = "grey") 
+sizes <- c("upregulated" = 2, "downregulated" = 2, "not" = 1) 
+alphas <- c("upregulated" = 1, "downregulated" = 1, "not" = 0.5)
+
+library(ggrepel)
+ggplot(data=c.vs.c,
+         aes(x = log2FoldChange,
+             y = -log10(padj))) + 
+    geom_point(aes(colour = gene_type), 
+             alpha = 1, 
+             shape = 16,
+             size = 1) +
+    geom_point(data = Arnt,
+             shape = 21,
+             size = 2, 
+             fill = "orange", 
+             colour = "black") +
+    geom_point(data = Esrrg,
+             shape = 21,
+             size = 2, 
+             fill = "orange", 
+             colour = "black") +
+  geom_point(data = Arid3b,
+             shape = 21,
+             size = 2, 
+             fill = "orange", 
+             colour = "black") +
+  geom_point(data = Nrf1,
+             shape = 21,
+             size = 2, 
+             fill = "orange", 
+             colour = "black") +
+  geom_point(data = Foxo3,
+             shape = 21,
+             size = 2, 
+             fill = "orange", 
+             colour = "black") +
+  geom_point(data = Arid5a,
+             shape = 21,
+             size = 2, 
+             fill = "orange", 
+             colour = "black") +
+  geom_point(data = Nfat5,
+             shape = 21,
+             size = 2, 
+             fill = "orange", 
+             colour = "black") +
+  geom_point(data = Runx1,
+             shape = 21,
+             size = 2, 
+             fill = "orange", 
+             colour = "black") +
+  geom_point(data = Soz17,
+             shape = 21,
+             size = 2, 
+             fill = "orange", 
+             colour = "black") +
+  geom_point(data = Prdm15,
+             shape = 21,
+             size = 2, 
+             fill = "orange", 
+             colour = "black") +
+  geom_point(data = Rxra,
+             shape = 21,
+             size = 2, 
+             fill = "orange", 
+             colour = "black") +
+  geom_point(data = Tbx6,
+             shape = 21,
+             size = 2, 
+             fill = "orange", 
+             colour = "black") +
+  geom_point(data = Rarb,
+             shape = 21,
+             size = 2, 
+             fill = "orange", 
+             colour = "black") +
+  geom_point(data = Plagl1,
+             shape = 21,
+             size = 2, 
+             fill = "orange", 
+             colour = "black") +
+    geom_point(data = Smad4,
+             shape = 21,
+             size = 2, 
+             fill = "orange", 
+             colour = "black") +
+  geom_hline(yintercept = -log10(0.1),
+             linetype = "dashed") + 
+  geom_vline(xintercept = 0,
+             linetype = "dashed") +
+  geom_label_repel(data = imp_genes, # Add labels last to appear as the top layer  
+                   aes(label = external_gene_name),
+                   force = 2,
+                   nudge_y = 1) +
+  scale_colour_manual(values = cols) +
+  labs(x = "log2(fold change)",
+      y = "-log10(adjusted P-value)",
+       colour = "") +
+  theme_bw() + # Select theme with a white background  
+  theme(panel.border = element_rect(colour = "black", fill = NA, size= 0.5),    
+        panel.grid.minor = element_blank(),
+        panel.grid.major = element_blank()) 
+
+
+#labelling 
+imp_genes <- c.vs.c %>%
+  filter(external_gene_name %in% c("Arnt", "Esrrg"))
+
+Arnt <- c.vs.c %>%
+  filter(external_gene_name == "Arnt")
+
+Esrrg <- c.vs.c %>%
+  filter(external_gene_name == "Esrrg")
+
+Arid3b <- c.vs.c %>%
+  filter(external_gene_name == "Arid3b")
+
+Nrf1 <- c.vs.c %>%
+  filter(external_gene_name == "Nrf1")
+
+Foxo3 <- c.vs.c %>%
+  filter(external_gene_name == "Foxo3")
+
+Arid5a <- c.vs.c %>%
+  filter(external_gene_name == "Arid5a")
+
+Nfat5 <- c.vs.c %>%
+  filter(external_gene_name == "Nfat5")
+
+Runx1 <- c.vs.c %>%
+  filter(external_gene_name == "Runx1")
+
+Soz17 <- c.vs.c %>%
+  filter(external_gene_name == "Sox17")
+
+Prdm15 <- c.vs.c %>%
+  filter(external_gene_name == "Prdm15")
+
+Rxra <- c.vs.c %>%
+  filter(external_gene_name == "Rxra")
+
+Tbx6 <- c.vs.c %>%
+  filter(external_gene_name == "Tbx6")
+
+Rarb <- c.vs.c %>%
+  filter(external_gene_name == "Rarb")
+
+Plagl1 <- c.vs.c %>%
+  filter(external_gene_name == "Plagl1")
+
+Smad4 <- c.vs.c %>%
+  filter(external_gene_name == "Smad4")
+
+
+
+
+
+
+```
+
+
+
+##Clustering 
+Clustering - what patterns are there in the data?
+
+## STEP 1: Finding all genes whose expression is significantly different across both conditions
+```{r}
+rld <- rlog(dds)
+
+assay(rld) <- limma::removeBatchEffect(assay(rld), covariates=rld$SV1)
+assay(rld) <- limma::removeBatchEffect(assay(rld), covariates = rld$SV2)
+
+results.lrt = results(dds)
+significant_results=results.lrt[!is.na(results.lrt$padj) & results.lrt$padj<0.1,] ##10% are false positives. 
+rld_signif = assay(rld)[rownames(significant_results),]
+
+#how many genes are significantly different?
+nrow(rld_signif) #6496
+
+```
+
+## STEP 2: Converting them to z-scores to scale them in a way that is easier to look for patterns
+```{r}
+rld_z = t(apply(rld_signif, 1, function(x){ (x - mean(x)) / sd(x)}))
+```
+
+## STEP 3: Setting up the basics of the heatmap
+```{r}
+thr = 3  ##threshold of 3 sd away 
+rld_z[rld_z > thr] = thr ## setting rld_z values > 3 as 3 
+rld_z[rld_z < -thr] = -thr ## setting rld_z values <-3 as -3 
+
+paletteLength = 20 ##making a pheatmap 
+breaksList <- c(seq(-thr, 0, length.out=ceiling(paletteLength/2) + 1), 
+              seq(thr/paletteLength, thr, length.out=floor(paletteLength/2)))
+
+# sort out colour scheme
+  color = c(colorRampPalette(c("mediumblue", "white"))(14), colorRampPalette(c("white", "firebrick2"))(14))
+## from blue-->white--> brick red 
+  breaksList = seq(-3, 3, length.out = 29)
+paletteLength = 20 ##making a pheatmap 
+breaksList <- c(seq(-thr, 0, length.out=ceiling(paletteLength/2) + 1), 
+              seq(thr/paletteLength, thr, length.out=floor(paletteLength/2)))
+
+  color = c(colorRampPalette(c("mediumblue", "white"))(14), colorRampPalette(c("white", "firebrick2"))(14))
+## from blue-->white--> brick red 
+  breaksList = seq(-3, 3, length.out = 29)
+```
+
+## STEP 4: K-means clustering: determining the value of k using the elbow criteria  
+```{r}
+set.seed(123)
+k.max <- 20 #setting for it to run until k=20 
+wss <- sapply(1:k.max, 
+              function(k){kmeans(rld_z, k, nstart=100,iter.max = 20 )$tot.withinss})
+wss
+plot(1:k.max, wss,
+     type="b", pch = 19, frame = FALSE, 
+     xlab="Number of clusters K",
+     ylab="Total within-clusters sum of squares", 
+     xlim=c(0,20)) 
+
+#from the plot, it seems like k=4 
+```
+
+
+## STEP 5: Running k-means clustering for 4 clusters
+```{r}
+set.seed(2)
+nclust = 2
+results.coef.kmeans =  kmeans(rld_z, nclust, nstart=100, iter.max=50)
+#saveRDS(results.coef.kmeans, file = "results.coef.kmeans.rm_all.rds")
+
+results.coef.kmeans = readRDS("results.coef.kmeans.rm_all.rds")
+results.coef = rld_z[order(results.coef.kmeans$cluster),]
+indicator = results.coef.kmeans$cluster[order(results.coef.kmeans$cluster)]  ## only want the cluster data
+table(indicator)
+
+heat.map <- pheatmap(results.coef, cluster_col=TRUE, breaks=breaksList, cluster_rows=FALSE, show_rownames=FALSE,color = color,fontsize_row = 3, legend=TRUE,border_color = NA, )
+```
+## STEP 5a: Running k-means clustering for 2 clusters
+```{r}
+#nclust = 2
+#results.coef.kmeans.2 =  kmeans(rld_z, nclust, nstart=100, iter.max=50)
+#saveRDS(results.coef.kmeans.2, file = "results.coef.2kmeans.rm_all.rds")
+
+results.coef.kmeans.2 = readRDS("results.coef.2kmeans.rm_all.rds")
+results.coef.2 = rld_z[order(results.coef.kmeans.2$cluster),]
+indicator = results.coef.kmeans.2$cluster[order(results.coef.kmeans.2$cluster)]  ## only want the cluster data
+table(indicator)
+
+#labeling the columns 
+my_condition_col <- data.frame(condition = rep(c("control", "cachectic", "control", "cachectic", "control", "cachectic", "control", "cachectic"), c(2,2,2,1,2,2,2,2)))
+row.names(my_condition_col) <- colnames(results.coef.2)
+
+my_colours <- list(condition=c(control="tomato1", cachectic = "brown3"))
+
+heat.map.2clusters <- pheatmap(results.coef.2, cluster_col=TRUE, breaks=breaksList, cluster_rows=FALSE, show_rownames=FALSE, color = color, fontsize_row = 3, legend=TRUE,border_color = NA, annotation_col = my_condition_col, annotation_colors = my_colours)
+
+
+```
+#heatmap hierachial clustering
+```{r}
+dd=dist(rld_z)
+cluster.hclust <- hclust(dd)
+cut_avg <- cutree(cluster.hclust, k = 2)
+
+cluster.hclust
+
+pheatmap(rld_z, cluster_col= TRUE, breaks=breaksList, 
+         cluster_rows = cluster.hclust , 
+         show_rownames = FALSE, 
+         color = color,fontsize_row = 3, legend=TRUE,border_color = NA)
+
+
+
+#adding key colour to show control and cachectic 
+
+#labeling the columns 
+my_condition_col <- data.frame(condition = rep(c("control", "cachectic", "control", "cachectic", "control", "cachectic", "control", "cachectic"), c(2,2,2,1,2,2,2,2)))
+row.names(my_condition_col) <- colnames(rld_z)
+
+my_colours <- list(condition=c(control="tomato1", cachectic = "brown3"))
+
+pheatmap(rld_z, cluster_col=TRUE, breaks=breaksList, cluster_rows=cut_avg, show_rownames=FALSE, color = color, fontsize_row = 3, legend=TRUE,border_color = NA, annotation_col = my_condition_col, annotation_colors = my_colours)
+
+
+
+
+
+
+```
+
+
+
+
+
+##Annotations  
+Annotating the clusters with the terms/processes/pathways that they are enriched with. Do these annotations make sense given the patterns in the clusters? Remember that clustering ordering changes between runs so make sure to remember to saveRDS and readRDS.
+
+## CLUSTER 1
+
+## Heat map of Cluster 1
+```{r}
+c1= names(results.coef.kmeans.2$cluster[results.coef.kmeans.2$cluster==1])
+
+heat.map.c1 <- pheatmap(results.coef[c1,], cluster_col=TRUE, breaks=breaksList, cluster_rows=FALSE, show_rownames=FALSE,color = color,fontsize_row = 3, legend=TRUE,border_color = NA, main = "Cluster 1")
+
+## genes are highly expressed in control samples, and lower in cachectic samples (with an exception of KPC cachectic replicate 2)
+```
+
+
+## Biological processes - operations or sets of molecular events with a defined beginning and end, pertinent to the functioning of integrated living units: cells, tissues, organs, and organisms
+```{r}
+ego.BP_c1 <- enrichGO(gene          = c1,
+                universe      = rownames(dds), ##background is all those genes in the system (dds) 
+                OrgDb         = org.Mm.eg.db,  ## contains annotations for MusMusculus 
+                keyType       = 'ENSEMBL',  ## tells annotations that these are all ensembl IDs 
+                ont           = "BP", 
+                pAdjustMethod = "BH", ## the benjaminy H correction 
+                pvalueCutoff  = 1,
+                qvalueCutoff  = 1,
+        readable      = TRUE)
+
+
+write.csv(as.data.frame(ego.BP_c1), "./results/go_bp_up.csv")
+
+dotplot(ego.BP_c1, title="GO:BP Cluster 1")
+```
+
+
+```{r eval=FALSE}
+Brief Analysis: 
+
+```
+
+## Molecular Functions - the elemental activities of a gene product at the molecular level, such as binding or catalysis
+```{r}
+ego.MF_c1 <- enrichGO(gene          = c1,
+                universe      = rownames(dds), ##background is all those genes in the system (dds) 
+                OrgDb         = org.Mm.eg.db,  ## contains annotations for MusMusculus 
+                keyType       = 'ENSEMBL',  ## tells annotations that these are all ensembl IDs 
+                ont           = "MF", 
+                pAdjustMethod = "BH", ## the benjaminy H correction 
+                pvalueCutoff  = 1,
+                qvalueCutoff  = 1,
+        readable      = TRUE)
+
+write.csv(as.data.frame(ego.MF_c1), "./results/go_mf_up.csv")
+
+dotplot(ego.MF_c1, title="GO:MF Cluster 1")
+```
+
+```{r eval=FALSE}
+Brief Analysis: 
+
+```
+
+## Cellular component - the parts of a cell or its extracellular environment.
+```{r}
+ego.CC_c1 <- enrichGO(gene          = c1,
+                universe      = rownames(dds), ##background is all those genes in the system (dds) 
+                OrgDb         = org.Mm.eg.db,  ## contains annotations for MusMusculus 
+                keyType       = 'ENSEMBL',  ## tells annotations that these are all ensembl IDs 
+                ont           = "CC", 
+                pAdjustMethod = "BH", ## the benjaminy H correction 
+                pvalueCutoff  = 1,
+                qvalueCutoff  = 1,
+        readable      = TRUE)
+
+write.csv(as.data.frame(ego.CC_c1), "./results/go_cc_up.csv")
+
+dotplot(ego.CC_c1, title="GO:CC Cluster 1")
+```
+
+```{r eval=FALSE}
+Brief Analysis:
+  
+```
+
+## KEGG Analysis - The KEGG pathway map is a moleculalr interaction/reaction network diagram
+```{r}
+kegg_c1 <- enrichKEGG( gene= as.character(ensembl.genes[c1,]$entrezgene_id),
+                      universe = as.character(ensembl.genes[rownames(dds),]$entrezgene_id), #is the background right?
+                      organism = 'mmu' ,
+                      pvalueCutoff = 1,
+                      qvalueCutoff = 1)
+
+write.csv(as.data.frame(kegg_c1), "./results/kegg_up.csv")
+
+dotplot(kegg_c1, title= "KEGG Cluster 1")
+```
+
+```{r eval=FALSE}
+Brief Analysis:
+```
+
+
+### CLUSTER 2 
+
+## Heat map of Cluster 2
+```{r}
+c2= names(results.coef.kmeans.2$cluster[results.coef.kmeans.2$cluster==2])
+
+heat.map.c2 <- pheatmap(results.coef.2[c2,], cluster_col=TRUE, breaks=breaksList, cluster_rows=FALSE, show_rownames=FALSE,color = color,fontsize_row = 3, legend=TRUE,border_color = NA, main = "Cluster 2")
+
+## genes are highly expressed in control samples, and lower in cachectic samples (with an exception of KPC cachectic replicate 2)
+```
+
+
+## Biological processes - operations or sets of molecular events with a defined beginning and end, pertinent to the functioning of integrated living units: cells, tissues, organs, and organisms
+```{r}
+ego.BP_c2 <- enrichGO(gene          = c2,
+                universe      = rownames(dds), ##background is all those genes in the system (dds) 
+                OrgDb         = org.Mm.eg.db,  ## contains annotations for MusMusculus 
+                keyType       = 'ENSEMBL',  ## tells annotations that these are all ensembl IDs 
+                ont           = "BP", 
+                pAdjustMethod = "BH", ## the benjaminy H correction 
+                pvalueCutoff  = 1,
+                qvalueCutoff  = 1,
+        readable      = TRUE)
+
+
+
+write.csv(as.data.frame(ego.BP_c2), "./results/go_bp_dn.csv")
+
+dotplot(ego.BP_c2, title="GO:BP Cluster 2")
+```
+
+```{r eval=FALSE}
+Brief Analysis: 
+
+```
+
+## Molecular Functions - the elemental activities of a gene product at the molecular level, such as binding or catalysis
+```{r}
+ego.MF_c2 <- enrichGO(gene          = c2,
+                universe      = rownames(dds), ##background is all those genes in the system (dds) 
+                OrgDb         = org.Mm.eg.db,  ## contains annotations for MusMusculus 
+                keyType       = 'ENSEMBL',  ## tells annotations that these are all ensembl IDs 
+                ont           = "MF", 
+                pAdjustMethod = "BH", ## the benjaminy H correction 
+                pvalueCutoff  = 1,
+                qvalueCutoff  = 1,
+        readable      = TRUE)
+
+write.csv(as.data.frame(ego.MF_c2), "./results/go_mf_dn.csv")
+dotplot(ego.MF_c2, title="GO:MF Cluster 2")
+```
+
+```{r eval=FALSE}
+Brief Analysis:
+
+```
+
+## Cellular component - the parts of a cell or its extracellular environment.
+```{r}
+ego.CC_c2 <- enrichGO(gene          = c2,
+                universe      = rownames(dds), ##background is all those genes in the system (dds) 
+                OrgDb         = org.Mm.eg.db,  ## contains annotations for MusMusculus 
+                keyType       = 'ENSEMBL',  ## tells annotations that these are all ensembl IDs 
+                ont           = "CC", 
+                pAdjustMethod = "BH", ## the benjaminy H correction 
+                pvalueCutoff  = 1,
+                qvalueCutoff  = 1,
+        readable      = TRUE)
+
+write.csv(as.data.frame(ego.MF_c2), "./results/go_mf_dn.csv")
+dotplot(ego.CC_c2, title="GO:CC Cluster 2")
+```
+
+```{r eval=FALSE}
+Brief analysis:
+ 
+```
+
+## KEGG Analysis - The KEGG pathway map is a moleculalr interaction/reaction network diagram
+```{r}
+kegg_c2 <- enrichKEGG( gene= as.character(ensembl.genes[c2,]$entrezgene_id),
+                      universe = as.character(ensembl.genes[rownames(dds),]$entrezgene_id),
+                      organism = 'mmu' ,
+                      pvalueCutoff=1,
+                      qvalueCutoff =1)
+
+write.csv(as.data.frame(kegg_c2), "./results/kegg_dn.csv")
+
+dotplot(kegg_c2, title= "KEGG Cluster 2")
+```
+
+```{r eval=FALSE}
+Brief Analysis:
+```
+
+
+## ANNOTATING GENES THAT ARE DIFFERENTIALLY EXPRESSED FROM CONTROL AND CACHECTIC TISSUE 
+
+#finding these genes 
+```{r}
+diff <- rownames(cachectic_vs_contol[!is.na(cachectic_vs_contol$padj) & cachectic_vs_contol$padj<0.1,])
+```
+
+#Annotating the Biological Processess of these genes 
+```{r}
+go.BP_diff <- enrichGO(gene = diff,
+                universe      = rownames(dds), ##background is all those genes in the system (dds) 
+                OrgDb         = org.Mm.eg.db,  ## contains annotations for MusMusculus 
+                keyType       = 'ENSEMBL',  ## tells annotations that these are all ensembl IDs 
+                ont           = "BP", 
+                pAdjustMethod = "BH", ## the benjaminy H correction 
+                pvalueCutoff  = 1,
+                qvalueCutoff  = 0.1,
+        readable      = TRUE)
+
+dotplot(go.BP_diff, title="GO:BP of all differentially expressed genes from Cachectic vs. Control")
+```
+
+#Annotating the Molecular Functions of these genes 
+```{r}
+go.MF_diff <- enrichGO(gene = diff,
+                universe      = rownames(dds), ##background is all those genes in the system (dds) 
+                OrgDb         = org.Mm.eg.db,  ## contains annotations for MusMusculus 
+                keyType       = 'ENSEMBL',  ## tells annotations that these are all ensembl IDs 
+                ont           = "MF", 
+                pAdjustMethod = "BH", ## the benjaminy H correction 
+                pvalueCutoff  = 1,
+                qvalueCutoff  = 0.1,
+        readable      = TRUE)
+
+dotplot(go.MF_diff, title="GO:MF of all differentially expressed genes from Cachectic vs. Control")
+```
+
+#Annotating the cellcular components of these genes 
+```{r}
+go.CC_diff <- enrichGO(gene = diff,
+                universe      = rownames(dds), ##background is all those genes in the system (dds) 
+                OrgDb         = org.Mm.eg.db,  ## contains annotations for MusMusculus 
+                keyType       = 'ENSEMBL',  ## tells annotations that these are all ensembl IDs 
+                ont           = "CC", 
+                pAdjustMethod = "BH", ## the benjaminy H correction 
+                pvalueCutoff  = 1,
+                qvalueCutoff  = 0.1,
+        readable      = TRUE)
+
+dotplot(go.CC_diff, title="GO:CC of all differentially expressed genes from Cachectic vs. Control")
+```
+
+
+## KEGG Analysis - The KEGG pathway map is a moleculalr interaction/reaction network diagram
+```{r}
+kegg_diff <- enrichKEGG( gene= as.character(ensembl.genes[diff,]$entrezgene_id),
+                      universe = as.character(ensembl.genes[rownames(dds),]$entrezgene_id), 
+                      organism = 'mmu' ,
+                      qvalueCutoff = 0.1)
+
+dotplot(kegg_diff, title= "KEGG of all differentially expressed genes from cachectic vs. control")
+```
+
+##ANNOTATING THE UPREGULATED GENES 
+
+
+```{r}
+#If we want to find the most up-regulated we can use the following code for more specific cut off
+
+#diff.up <- rownames(cachectic_vs_contol[!is.na(cachectic_vs_contol$padj) & cachectic_vs_contol$padj<0.1 & cachectic_vs_contol$log2FoldChange>1,])  ## up-regulated genes
+
+#finding the upregulated genes
+up <- rownames(cachectic_vs_contol[!is.na(cachectic_vs_contol$padj) & cachectic_vs_contol$padj<0.1 & cachectic_vs_contol$log2FoldChange>0,])
+```
+
+##Biological Processes  
+```{r}
+go.BP_diff.up <- enrichGO(gene  = up,
+                universe      = rownames(dds), ##background is all those genes in the system (dds) 
+                OrgDb         = org.Mm.eg.db,  ## contains annotations for MusMusculus 
+                keyType       = 'ENSEMBL',  ## tells annotations that these are all ensembl IDs 
+                ont           = "BP", 
+                pAdjustMethod = "BH", ## the benjaminy H correction 
+                pvalueCutoff  = 1,
+                qvalueCutoff  = 0.05,
+        readable      = TRUE)
+
+dotplot(go.BP_diff.up, title="GO:BP of upregulated differentially expressed genes from cachectic vs. control")
+```
+#Trying simplify as part of the clusterprofiler function to remove redundant GO terms
+```{r}
+go.BP_diff.up.v2 <- simplify(go.BP_diff.up, 
+                               cutoff=0.4, 
+                               by="p.adjust", 
+                               select_fun= min, measure="Wang")
+
+
+dotplot(go.BP_diff.up.v2, title="GO:BP of upregulated differentially expressed genes from cachectic vs. control")
+
+#https://github.com/YuLab-SMU/clusterProfiler/issues/28
+```
+#Extracting the relevant rows 
+```{r}
+
+go.BP_diff.up.v2.data <- go.BP_diff.up.v2@result
+go.BP_diff.up.v2.data <- go.BP_diff.up.v2.data[c(3,9,5),]
+
+```
+
+
+##Molecular Function 
+```{r}
+go.MF_diff.up <- enrichGO(gene  = up,
+                universe      = rownames(dds), ##background is all those genes in the system (dds) 
+                OrgDb         = org.Mm.eg.db,  ## contains annotations for MusMusculus 
+                keyType       = 'ENSEMBL',  ## tells annotations that these are all ensembl IDs 
+                ont           = "MF", 
+                pAdjustMethod = "BH", ## the benjaminy H correction 
+                pvalueCutoff  = 1,
+                qvalueCutoff  = 0.05,
+        readable      = TRUE)
+
+
+dotplot(go.MF_diff.up, title="GO:MF of upregulated differentially expressed genes from cachectic vs. control")
+```
+
+#Trying simplify as part of the clusterprofiler function to remove redundant GO terms
+```{r}
+go.MF_diff.up.v2 <- simplify(go.MF_diff.up, 
+                               cutoff=0.3, 
+                               by="p.adjust", 
+                               select_fun= min, measure="Wang")
+
+
+dotplot(go.MF_diff.up.v2, title="GO:MF of upregulated differentially expressed genes from cachectic vs. control")
+
+#https://github.com/YuLab-SMU/clusterProfiler/issues/28
+```
+#Extracting the relevant rows 
+```{r}
+
+go.MF_diff.up.v2.data <- go.MF_diff.up.v2@result
+go.MF_diff.up.v2.data <- go.MF_diff.up.v2.data[c(2,4),]
+
+```
+
+##Cellular Component
+```{r}
+go.CC_diff.up <- enrichGO(gene  = up,
+                universe      = rownames(dds), ##background is all those genes in the system (dds) 
+                OrgDb         = org.Mm.eg.db,  ## contains annotations for MusMusculus 
+                keyType       = 'ENSEMBL',  ## tells annotations that these are all ensembl IDs 
+                ont           = "CC", 
+                pAdjustMethod = "BH", ## the benjaminy H correction 
+                pvalueCutoff  = 1,
+                qvalueCutoff  = 0.05,
+        readable      = TRUE)
+
+dotplot(go.CC_diff.up, title="GO:CC of upregulated differentially expressed genes from cachectic vs. control")
+```
+
+#Trying simplify as part of the clusterprofiler function to remove redundant GO terms
+```{r}
+go.CC_diff.up.v2 <- simplify(go.CC_diff.up, 
+                               cutoff=0.7, 
+                               by="p.adjust", 
+                               select_fun= min, measure="Wang")
+
+
+dotplot(go.CC_diff.up.v2, title="GO:CC of downregulated differentially expressed genes from cachectic vs. control")
+
+#https://github.com/YuLab-SMU/clusterProfiler/issues/28
+```
+
+#Extracting the relevant rows 
+```{r}
+
+go.CC_diff.up.v2.data <- go.CC_diff.up.v2@result
+go.CC_diff.up.v2.data <- go.CC_diff.up.v2.data[1,]
+
+```
+
+## KEGG Analysis - The KEGG pathway map is a molecular interaction/reaction network diagram
+```{r}
+kegg_diff.up <- enrichKEGG( gene= as.character(ensembl.genes[up,]$entrezgene_id),
+                      universe = as.character(ensembl.genes[rownames(dds),]$entrezgene_id), 
+                      organism = 'mmu' ,
+                      qvalueCutoff = 0.05)
+
+dotplot(kegg_diff.up, title= "KEGG of upregulated genes from cachectic vs. control")
+
+
+kegg_diff.up.data <- kegg_diff.up@result
+kegg_diff.up.data$lg10 <- -log10(kegg_diff.up.data$p.adjust)
+kegg_diff.up.data <- kegg_diff.up.data[c(2,7,10,9),]
+
+dotplot(kegg_diff.up.data, title= "")
+
+
+kegg_diff.up.data %>%
+                arrange(lg10) %>%    # First sort by val. This sort the dataframe but NOT the 
+                mutate(Description=factor(Description, levels=Description)) %>% 
+                ggplot( aes(x=lg10, y=Description)) +
+                geom_bar(stat = "identity", fill = "firebrick2") +
+                theme(axis.text.y = element_text(size=11),
+                panel.background = element_rect(fill='transparent'),
+                plot.background = element_rect(fill='transparent', color=NA),
+                axis.line.x = element_line(color="black"),
+                axis.line.y = element_line(color="black"),
+                legend.background = element_rect(fill='transparent'),
+                legend.box.background = element_rect(fill='transparent')) +
+                ggtitle("KEGG") + ylab("") + xlab("-log10(padj value)") +
+                scale_x_continuous(expand = c(0,0))
+
+kegg.up.plot
+```
+
+#plots of the upregulated
+```{r}
+library(ggplot2)
+library(dplyr)
+
+go.BP_diff.up.v2.data$lg10 <- -log10(go.BP_diff.up.v2.data$p.adjust)
+
+go.BP_diff.up.v2.data%>%
+                arrange(lg10) %>%    # First sort by val. This sort the dataframe but NOT the 
+                mutate(Description=factor(Description, levels=Description)) %>% 
+                ggplot( aes(x=lg10, y=Description)) +
+                geom_bar(stat = "identity", fill = "firebrick2") +
+                theme(axis.text.y = element_text(size=11),
+                panel.background = element_rect(fill='transparent'),
+                plot.background = element_rect(fill='transparent', color=NA),
+                axis.line.x = element_line(color="black"),
+                axis.line.y = element_line(color="black"),
+                legend.background = element_rect(fill='transparent'),
+                legend.box.background = element_rect(fill='transparent')) +
+                ggtitle("GO:Biological Process") + ylab("") + xlab("-log10(padj value)") +
+                scale_x_continuous(expand = c(0,0))
+
+
+
+go.MF_diff.up.v2.data$lg10 <- -log10(go.MF_diff.up.v2.data$p.adjust)
+
+go.MF_diff.up.v2.data%>%
+                arrange(lg10) %>%    # First sort by val. This sort the dataframe but NOT the 
+                mutate(Description=factor(Description, levels=Description)) %>% 
+                ggplot( aes(x=lg10, y=Description)) +
+                geom_bar(stat = "identity", fill = "firebrick2", width=0.8) +
+                theme(axis.text.y = element_text(size=11),
+                panel.background = element_rect(fill='transparent'),
+                plot.background = element_rect(fill='transparent', color=NA),
+                axis.line.x = element_line(color="black"),
+                axis.line.y = element_line(color="black"),
+                legend.background = element_rect(fill='transparent'),
+                legend.box.background = element_rect(fill='transparent')) +
+                ggtitle("GO:Molecular Function") + ylab("") + xlab("-log10(padj value)") +
+                scale_x_continuous(expand = c(0,0))
+
+
+go.CC_diff.up.v2.data$lg10 <- -log10(go.CC_diff.up.v2.data$pvalue)
+
+CC.up.plot <- go.CC_diff.up.v2.data%>%
+                arrange(lg10) %>%    # First sort by val. This sort the dataframe but NOT the 
+                mutate(Description=factor(Description, levels=Description)) %>% 
+                ggplot( aes(x=lg10, y=Description)) +
+                geom_bar(stat = "identity", fill = "firebrick2", width=0.3) +
+                theme(axis.text.y = element_text(size=11),
+                panel.background = element_rect(fill='transparent'),
+                plot.background = element_rect(fill='transparent', color=NA),
+                axis.line.x = element_line(color="black"),
+                axis.line.y = element_line(color="black"),
+                legend.background = element_rect(fill='transparent'),
+                legend.box.background = element_rect(fill='transparent')) +
+                ggtitle("GO Cellular Components") + ylab("") + xlab("-log10(pvalue)") +
+                scale_x_continuous(expand = c(0,0))
+
+
+BP.up.plot
+MF.up.plot
+CC.up.plot
+
+
+```
+
+##ANNOTATING THE DOWNREGULATED GENES 
+```{r}
+#code for significantly down reg 
+#diff.down <- rownames(cachectic_vs_contol[!is.na(cachectic_vs_contol$padj) & cachectic_vs_contol$padj<0.1 & cachectic_vs_contol$log2FoldChange< -1,])  ## down-regulated genes 
+
+down <- rownames(cachectic_vs_contol[!is.na(cachectic_vs_contol$padj) & cachectic_vs_contol$padj<0.1 & cachectic_vs_contol$log2FoldChange< 0,])
+```
+
+##Biological Processes  
+```{r}
+go.BP_diff.down <- enrichGO(gene  = down,
+                universe      = rownames(dds), ##background is all those genes in the system (dds) 
+                OrgDb         = org.Mm.eg.db,  ## contains annotations for MusMusculus 
+                keyType       = 'ENSEMBL',  ## tells annotations that these are all ensembl IDs 
+                ont           = "BP", 
+                pAdjustMethod = "BH", ## the benjaminy H correction 
+                pvalueCutoff  = 1,
+                qvalueCutoff  = 0.05,
+        readable      = TRUE)
+
+dotplot(go.BP_diff.down, title="GO:BP of downregulated differentially expressed genes from cachectic vs. control")
+```
+#Trying GOSemSim
+```{r}
+library(GOSemSim)
+
+semdata<- godata('org.Mm.eg.db', ont="BP", computeIC=FALSE)
+
+entrezgene.down <- as.data.frame(diff.down)
+entrezgene.down$entrezgeneid <- bm.annotations$entrezgene_id[ match(entrezgene.down$diff.down, bm.annotations$ensembl_gene_id) ]
+
+entrezgene.down <- as.list(entrezgene.down$entrezgeneid)
+  
+simMatrix.down.BP <- mgeneSim(
+entrezgene.down,
+semdata,
+measure = "Wang",
+drop = "IEA",
+combine = "BMA",
+verbose = TRUE
+)
+
+#reduceSimMatrix Reduce a set of GO terms based on their semantic similarity and scores
+library(rrvgo)
+reduceSimMatrix(
+simMatrix.down.BP,
+scores = NULL,
+threshold = 0.7,
+org.Mm.eg.db,
+keytype = "ENTREZID"
+)
+```
+#Trying simplify as part of the clusterprofiler function to remove redundant GO terms
+```{r}
+go.BP_diff.down.v2 <- simplify(go.BP_diff.down, 
+                               cutoff=0.5, 
+                               by="p.adjust", 
+                               select_fun= min, measure="Wang")
+
+
+dotplot(go.BP_diff.down.v2, title="GO:BP of downregulated differentially expressed genes from cachectic vs. control")
+
+#https://github.com/YuLab-SMU/clusterProfiler/issues/28
+```
+
+#Making a dataframe to include the relevant enrichment terms
+```{r}
+go.BP_diff.down.v2.data <- go.BP_diff.down.v2@result
+go.BP_diff.down.v2.data <- go.BP_diff.down.v2.data[c(2:4,6),]
+
+```
+
+
+##Molecular Function 
+```{r}
+go.MF_diff.down <- enrichGO(gene  = down,
+                universe      = rownames(dds), ##background is all those genes in the system (dds) 
+                OrgDb         = org.Mm.eg.db,  ## contains annotations for MusMusculus 
+                keyType       = 'ENSEMBL',  ## tells annotations that these are all ensembl IDs 
+                ont           = "MF", 
+                pAdjustMethod = "BH", ## the benjaminy H correction 
+                pvalueCutoff  = 1,
+                qvalueCutoff  = 0.05,
+        readable      = TRUE)
+
+dotplot(go.MF_diff.down, title="GO:MF of downregulated differentially expressed genes from cachectic vs. control")
+```
+
+#Trying simplify as part of the clusterprofiler function to remove redundant GO terms
+```{r}
+go.MF_diff.down.v2 <- simplify(go.MF_diff.down, 
+                               cutoff=0.5, 
+                               by="p.adjust", 
+                               select_fun= min, measure="Wang")
+
+
+dotplot(go.MF_diff.down.v2, title="GO:MF of downregulated differentially expressed genes from cachectic vs. control")
+
+#https://github.com/YuLab-SMU/clusterProfiler/issues/28
+```
+
+#Making a dataframe to include the relevant MF enrichment terms
+```{r}
+go.MF_diff.down.v2.data <- go.MF_diff.down.v2@result
+go.MF_diff.down.v2.data <- go.MF_diff.down.v2.data[c(1:5),]
+```
+
+##Cellular Component
+```{r}
+go.CC_diff.down <- enrichGO(gene  = down,
+                universe      = rownames(dds), ##background is all those genes in the system (dds) 
+                OrgDb         = org.Mm.eg.db,  ## contains annotations for MusMusculus 
+                keyType       = 'ENSEMBL',  ## tells annotations that these are all ensembl IDs 
+                ont           = "CC", 
+                pAdjustMethod = "BH", ## the benjaminy H correction 
+                pvalueCutoff  = 1,
+                qvalueCutoff  = 0.05,
+        readable      = TRUE)
+
+
+dotplot(go.CC_diff.down, title="GO:CC of downregulated differentially expressed genes from cachectic vs. control")
+```
+
+#Trying simplify as part of the clusterprofiler function to remove redundant GO terms
+```{r}
+go.CC_diff.down.v2 <- simplify(go.CC_diff.down, 
+                               cutoff=0.6, 
+                               by="p.adjust", 
+                               select_fun= min, measure="Wang")
+
+
+dotplot(go.CC_diff.down.v2, title="GO:CC of downregulated differentially expressed genes from cachectic vs. control")
+
+#https://github.com/YuLab-SMU/clusterProfiler/issues/28
+```
+#Making a dataframe to include the relevant CC enrichment terms
+```{r}
+go.CC_diff.down.v2.data <- go.CC_diff.down.v2@result
+go.CC_diff.down.v2.data <- go.CC_diff.down.v2.data[c(1,2,4,7),]
+```
+
+
+
+
+#plot all of them into one plot 
+```{r}
+library(ggplot2)
+library(dplyr)
+
+go.BP_diff.down.v2.data$lg10 <- -log10(go.BP_diff.down.v2.data$p.adjust)
+
+go.BP_diff.down.v2.data %>%
+                arrange(lg10) %>%    # First sort by val. This sort the dataframe but NOT the 
+                mutate(Description=factor(Description, levels=Description)) %>% 
+                ggplot( aes(x=lg10, y=Description)) +
+                geom_bar(stat = "identity", fill = "navyblue") +
+                theme(axis.text.y = element_text(size=11),
+                panel.background = element_rect(fill='transparent'),
+                plot.background = element_rect(fill='transparent', color=NA),
+                axis.line.x = element_line(color="black"),
+                axis.line.y = element_line(color="black"),
+                legend.background = element_rect(fill='transparent'),
+                legend.box.background = element_rect(fill='transparent')) +
+                ggtitle("GO:Biological Process") + ylab("") + xlab("-log10(padj value)") +
+                scale_x_continuous(expand = c(0,0))
+                
+
+go.MF_diff.down.v2.data$lg10 <- -log10(go.MF_diff.down.v2.data$p.adjust)
+MF.down.plot <- go.MF_diff.down.v2.data %>%
+                arrange(lg10) %>%    # First sort by val. This sort the dataframe but NOT the 
+                mutate(Description=factor(Description, levels=Description)) %>% 
+                ggplot( aes(x=lg10, y=Description)) +
+                geom_bar(stat = "identity", fill = "navyblue") +
+                theme(axis.text.y = element_text(size=11),
+                panel.background = element_rect(fill='transparent'),
+                plot.background = element_rect(fill='transparent', color=NA),
+                axis.line.x = element_line(color="black"),
+                axis.line.y = element_line(color="black"),
+                legend.background = element_rect(fill='transparent'),
+                legend.box.background = element_rect(fill='transparent')) +
+                ggtitle("GO:Molecular Function") + ylab("") + xlab("-log10(padj value)") +
+                scale_x_continuous(expand = c(0,0))
+
+
+
+go.CC_diff.down.v2.data$lg10 <- -log10(go.CC_diff.down.v2.data$p.adj)
+CC.down.plot <- go.CC_diff.down.v2.data %>%
+                arrange(lg10) %>%    # First sort by val. This sort the dataframe but NOT the 
+                mutate(Description=factor(Description, levels=Description)) %>% 
+                ggplot( aes(x=lg10, y=Description)) + 
+                geom_bar(stat = "identity", fill = "navyblue") +
+                theme(axis.text.y = element_text(size=11),
+                panel.background = element_rect(fill='transparent'),
+                plot.background = element_rect(fill='transparent', color=NA),
+                axis.line.x = element_line(color="black"),
+                axis.line.y = element_line(color="black"),
+                legend.background = element_rect(fill='transparent'),
+                legend.box.background = element_rect(fill='transparent')) +
+                ggtitle("GO:Cellular Component") + ylab("") + xlab("-log10(padj value)") +
+                scale_x_continuous(expand = c(0,0))
+
+BP.down.plot
+MF.down.plot
+CC.down.plot
+
+
+                
+
+```
+
+## KEGG Analysis - The KEGG pathway map is a molecular interaction/reaction network diagram
+```{r}
+kegg_diff.down <- enrichKEGG( gene= as.character(ensembl.genes[down,]$entrezgene_id),
+                      universe = as.character(ensembl.genes[rownames(dds),]$entrezgene_id), 
+                      organism = 'mmu' ,
+                      qvalueCutoff = 0.05)
+
+dotplot(kegg_diff.down, title= "KEGG of downregulated genes from cachectic vs. control")
+
+kegg_diff.down.data <- kegg_diff.down@result
+kegg_diff.down.data$lg10 <- -log10(kegg_diff.down.data$p.adjust)
+kegg_diff.down.data <- kegg_diff.down.data[c(1,2,12),]
+
+
+kegg_diff.down.data %>%
+                arrange(lg10) %>%    # First sort by val. This sort the dataframe but NOT the 
+                mutate(Description=factor(Description, levels=Description)) %>% 
+                ggplot( aes(x=lg10, y=Description)) +
+                geom_bar(stat = "identity", fill = "navyblue") +
+                theme(axis.text.y = element_text(size=11),
+                panel.background = element_rect(fill='transparent'),
+                plot.background = element_rect(fill='transparent', color=NA),
+                axis.line.x = element_line(color="black"),
+                axis.line.y = element_line(color="black"),
+                legend.background = element_rect(fill='transparent'),
+                legend.box.background = element_rect(fill='transparent')) +
+                ggtitle("KEGG") + ylab("") + xlab("-log10(padj value)") +
+                scale_x_continuous(expand = c(0,0))
+```
+
+
+##Plotting all the GO enrichments of the upregulated and downregulated and the KEGG pathways
+http://www.sthda.com/english/articles/24-ggpubr-publication-ready-plots/81-ggplot2-easy-way-to-mix-multiple-graphs-on-the-same-page/#:~:text=To%20arrange%20multiple%20ggplot2%20graphs,multiple%20ggplots%20on%20one%20page 
+
+https://wilkelab.org/cowplot/articles/plot_grid.html 
+```{r}
+
+library("gridExtra")
+library("cowplot")
+
+
+plot_grid (BP.up.plot, NULL,
+           BP.down.plot, 
+           MF.up.plot,  NULL,
+           MF.down.plot,  
+           CC.up.plot,   NULL,  
+           CC.down.plot,  
+           kegg.up.plot,  NULL,
+           kegg.down.plot,
+           align="hv", 
+           labels = c('a','', 'e', 'b', '', 'f', 'c', '', 'g', 'd','','h'),
+           rel_widths = c(1, 0.1, 1),
+           nrow= 4, ncol=3)
+```
+#the KEGG pathways 
+```{r}
+## graphing data points from 2 different datasets on one graph
+
+ggplot(kegg_diff.down, aes(x=-log10(pvalue), y=Description)) + 
+                geom_bar(stat = "identity", fill = "firebrick") +
+                theme(
+                panel.background = element_rect(fill='transparent'),
+                plot.background = element_rect(fill='transparent', color=NA),
+                axis.line.x = element_line(color="black"),
+                axis.line.y = element_line(color="black"),
+                legend.background = element_rect(fill='transparent'),
+                legend.box.background = element_rect(fill='transparent')) +
+                ggtitle("KEGG Pathways") + ylab("") +
+                scale_x_continuous(expand = c(0,0)) +
+  
+  ggplot(kegg_diff, aes(x=-log10(pvalue), y=Description)) + 
+                geom_bar(stat = "identity", fill = "forestgreen") +
+                theme(
+                panel.background = element_rect(fill='transparent'),
+                plot.background = element_rect(fill='transparent', color=NA),
+                axis.line.x = element_line(color="black"),
+                axis.line.y = element_line(color="black"),
+                legend.background = element_rect(fill='transparent'),
+                legend.box.background = element_rect(fill='transparent')) +
+                ggtitle("KEGG Pathways") + ylab("") +
+                scale_x_continuous(expand = c(0,0))
+
+```
+
+
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.

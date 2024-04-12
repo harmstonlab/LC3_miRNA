@@ -1,0 +1,17 @@
+name	cell_line	condition	replicate	sex	strain	geo_id	bam
+KPP_control_rep1	KPP	control	1	Male	C57BL/6J	GSM3911268	GSM3911268Aligned.toTranscriptome.out.bam
+KPP_control_rep2	KPP	control	2	Male	C57BL/6J	GSM3911269	GSM3911269Aligned.toTranscriptome.out.bam
+KPP_cachectic_rep1	KPP	cachectic	1	Male	C57BL/6J	GSM3911270	GSM3911270Aligned.toTranscriptome.out.bam
+KPP_cachectic_rep2	KPP	cachectic	2	Male	C57BL/6J	GSM3911271	GSM3911271Aligned.toTranscriptome.out.bam
+KPC_control_rep1	KPC	control	1	Male	mixed	GSM3911272	GSM3911272Aligned.toTranscriptome.out.bam
+KPC_control_rep2	KPC	control	2	Male	mixed	GSM3911273	GSM3911273Aligned.toTranscriptome.out.bam
+KPC_cachectic_rep1	KPC	cachectic	1	Male	mixed	GSM3911274	GSM3911274Aligned.toTranscriptome.out.bam
+KPC_cachectic_rep2	KPC	cachectic	2	Male	mixed	GSM3911275	GSM3911275Aligned.toTranscriptome.out.bam
+C26_control_rep1	C26	control	1	Male	CD2F1	GSM3911276	GSM3911276Aligned.toTranscriptome.out.bam
+C26_control_rep2	C26	control	2	Male	CD2F1	GSM3911277	GSM3911277Aligned.toTranscriptome.out.bam
+C26_cachectic_rep1	C26	cachectic	1	Male	CD2F1	GSM3911278	GSM3911278Aligned.toTranscriptome.out.bam
+C26_cachectic_rep2	C26	cachectic	2	Male	CD2F1	GSM3911279	GSM3911279Aligned.toTranscriptome.out.bam
+LLC_control_rep1	LLC	control	1	Male	C57BL/6J	GSM3911280	GSM3911280Aligned.toTranscriptome.out.bam
+LLC_control_rep2	LLC	control	2	Male	C57BL/6J	GSM3911281	GSM3911281Aligned.toTranscriptome.out.bam
+LLC_cachectic_rep1	LLC	cachectic	1	Male	C57BL/6J	GSM3911282	GSM3911282Aligned.toTranscriptome.out.bam
+LLC_cachectic_rep2	LLC	cachectic	2	Male	C57BL/6J	GSM3911283	GSM3911283Aligned.toTranscriptome.out.bam

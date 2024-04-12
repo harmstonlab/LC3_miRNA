@@ -1,0 +1,602 @@
+---
+title: "Differential Expression with SV1 + SV2 + KPC Removal"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Loading in necessary packages 
+
+```{r}
+library(DESeq2)
+library(ggplot2)
+library(genefilter)
+library(GenomicFeatures)
+library(biomaRt)
+library(knitr)
+library(reshape2)
+library(scales)
+library(Biostrings)
+library(kableExtra)
+library(pheatmap)
+library(org.Mm.eg.db)
+library(clusterProfiler)
+library("RColorBrewer")
+```
+
+## Creating the Input + Gene annotations 
+```{r}
+#read in the ensembl.genes 
+
+mm.gtf.db <- makeTxDbFromGFF("annotation/Mus_musculus.GRCm38.102.chr.gtf", format="gtf" )
+ensembl.genes = genes(mm.gtf.db)
+
+mouse = useEnsembl(biomart="ENSEMBL_MART_ENSEMBL", dataset="mmusculus_gene_ensembl", version = "102")
+
+bm.annotations = getBM(attributes=c("ensembl_gene_id", "entrezgene_id", "gene_biotype", "mgi_symbol", "description", "external_gene_name"), mart=mouse, filters="ensembl_gene_id", values=ensembl.genes$gene_id, uniqueRows=TRUE)
+
+ensembl.genes$external_gene_name = bm.annotations$external_gene_name[ match(ensembl.genes$gene_id, bm.annotations$ensembl_gene_id) ]
+
+ensembl.genes$gene_biotype = bm.annotations$gene_biotype[ match(ensembl.genes$gene_id, bm.annotations$ensembl_gene_id) ]
+
+ensembl.genes$mgi_symbol = bm.annotations$mgi_symbol[ match(ensembl.genes$gene_id, bm.annotations$ensembl_gene_id) ]
+
+ensembl.genes$description = bm.annotations$description[ match(ensembl.genes$gene_id, bm.annotations$ensembl_gene_id) ]
+
+ensembl.genes$entrezgene_id = bm.annotations$entrezgene_id[ match(ensembl.genes$gene_id, bm.annotations$ensembl_gene_id) ]
+```
+
+## Creating dataset from the Experimental metadata 
+```{r}
+#read in the experimental metadata 
+experimental_metadata = read.delim("experimental_metadata.txt", sep="\t")
+
+#deleting the row that has KPC cachectic replicate 2 
+
+#create matrix of data 
+data = matrix(0, ncol=length(experimental_metadata$name), nrow=55401)
+colnames(data)= experimental_metadata$name
+for( i in experimental_metadata$name){
+  data[,i] = read.table(paste("data/", i, ".genes.results",sep=""), sep="\t", header=TRUE)$expected_count
+}
+row.names(data) = read.table(paste("data/", i, ".genes.results",sep=""), sep="\t", header=TRUE)$gene_id
+
+#Create a factor for the condition column (Cachectic vs. Control) - by making it a factor you give it an order
+experimental_metadata$condition = factor(experimental_metadata$condition, levels=c("control", "cachectic"))
+
+#Create a factor for the replicate column - by making it a factor you give it an order
+experimental_metadata$replicate = factor(experimental_metadata$replicate, levels=c("1", "2"))
+
+#Create a factor for the cell type column - by making it a factor you give it an order
+experimental_metadata$cell_line = factor(experimental_metadata$cell_line, levels = c("KPP", "KPC", "C26", "LLC"))
+
+#Preparing for DESeq - converting everything to be integers 
+data_mat = apply(round(data), c(1,2), as.integer)
+data_mat = subset(data_mat, select= -8) #removing the 8th column that consists of KPC cachectic rep
+experimental_metadata = experimental_metadata[-8,]
+```
+
+```{r}
+data_mat = data_mat[!(row.names(data_mat) %in% ensembl.genes$gene_id[ensembl.genes$gene_biotype %in% c("rRNA", "snoRNA", "snRNA", "Mt_rRNA")]),]
+data_mat = data_mat[rowSums(data_mat) > 0,]
+data_mat = data_mat[ !(row.names(data_mat) %in% ensembl.genes[seqnames(ensembl.genes) == "chrM"]$gene_id), ]
+
+```
+
+```{r}
+dds = DESeqDataSetFromMatrix(data_mat, experimental_metadata, ~ cell_line + condition)
+
+dds <- estimateSizeFactors(dds) 
+dds <- estimateDispersions(dds)
+```
+
+```{r hclust}
+rld <- rlog(dds)
+sampleDists <- dist(t(assay(rld)))
+plot(hclust(sampleDists))
+```
+
+
+### Correlation Heatmap
+```{r}
+annot = dplyr::select(experimental_metadata, c(cell_line, condition))
+row.names(annot) = experimental_metadata$name
+rld %>%
+  assay() %>%
+  cor() %>%
+  pheatmap(color = colorRampPalette(rev(brewer.pal(n = 7, name = "RdBu")))(100),
+           annotation = annot,
+           annotation_colors = list(
+                               condition = c(control = "blue", cachectic= "red"),
+                               cell_line = c(C26 = "#BF3100", KPC = "#E9B44C", 
+                                             KPP = "#1B998B", LLC = "#5D576B")),
+           cluster_rows = TRUE,
+           cluster_cols = T,
+           cellwidth = 13,
+           cellheight = 13)
+```
+
+### PCA
+```{r pca_samples, results='hide'}
+ntop = 500
+rv <- rowVars(assay(rld))
+select <- order(rv, decreasing = TRUE)[seq_len(min(ntop, length(rv)))]
+pca = prcomp(t(assay(rld)[select,]))
+percentVar <- pca$sdev^2/sum(pca$sdev^2)
+
+pca_data <- plotPCA(rld, intgroup = c("cell_line", "condition"), returnData=TRUE)
+percentVar <- round(100 * attr(pca_data, "percentVar"), digits=2)
+ggplot(pca_data, aes(PC1, PC2, color=condition, shape=cell_line)) + geom_point(size=3) +
+  scale_x_continuous(paste0("PC1: ",percentVar[1],"% variance"), limits=c(-20, 30)) +
+  scale_y_continuous(paste0("PC2: ",percentVar[2],"% variance")) + 
+  coord_fixed() + theme_classic() + geom_text(data = pca_data, aes(PC1,PC2, label = name), hjust = 1.2)
+
+```
+
+PC1 is really messing up with C26 - represents differences in mouse strain, so there are definitely batch/technical artefacts in this dataset - lets use SVA to handle this
+
+```{r}
+library(sva)
+dat <- counts(dds, normalized= TRUE)
+idx  <- rowMeans(dat) > 1
+dat  <- dat[idx, ]
+mod  <- model.matrix(~ cell_line + condition, colData(dds))
+mod0 <- model.matrix(~cell_line , colData(dds)) #
+svseq <- svaseq(dat, mod, mod0, n.sv = 2) # allowing n.sv does not enable the linear model to converge
+
+ddssva <- dds
+ddssva$SV1 <- svseq$sv[,1]
+ddssva$SV2 <- svseq$sv[,2]
+design(ddssva) <- ~ SV1 + SV2 + cell_line + condition
+```
+
+```{r}
+rld <- rlog(ddssva)
+```
+
+Plotting PCA of SV1 - to analyse if this is the hidden effect we are looking for
+```{r}
+
+(pca_data <- plotPCA(rld, intgroup = c("SV1", "SV2"), returnData=TRUE))
+percentVar <- round(100 * attr(pca_data, "percentVar"), digits=2)
+ggplot(pca_data, aes(PC1, PC2, color=SV1)) + geom_point(size=3) +
+  scale_x_continuous(paste0("PC1: ",percentVar[1],"% variance"), limits = c(-15, 30)) +
+  scale_y_continuous(paste0("PC2: ",percentVar[2],"% variance")) + 
+  coord_fixed() + ggtitle("PCA with SV1 highlighted")+ theme_classic() + geom_text(size= 3, data = pca_data, aes(PC1,PC2, label = name), hjust = 0.6)
+
+```
+
+
+```{r}
+
+boxplot(rld$SV1 ~ rld$cell_line, xlab="Cell line", ylab="SV1", ylim=c(-0.6, 0.4))
+
+stripchart(rld$SV1 ~rld$cell_line,  
+           method = "jitter",       
+           pch = 19,          
+           col = 4,            
+           vertical = TRUE,      
+           add = TRUE)
+```
+
+
+```{r}
+(pca_data <- plotPCA(rld, intgroup = c("SV1", "SV2"), returnData=TRUE))
+percentVar <- round(100 * attr(pca_data, "percentVar"), digits=2)
+ggplot(pca_data, aes(PC1, PC2, color=SV2)) + geom_point(size=3) +
+  scale_x_continuous(paste0("PC1: ",percentVar[1],"% variance")) +
+  scale_y_continuous(paste0("PC2: ",percentVar[2],"% variance")) + 
+  coord_fixed() + ggtitle("PCA for whole dataset")+ theme_classic() + geom_text(size= 3, data = pca_data, aes(PC1,PC2, label = name), hjust = 0.6)
+```
+
+```{r}
+
+boxplot(rld$SV2 ~ rld$cell_line, xlab="Cell line", ylab="SV2", ylim=c(-0.8, 0.4))
+
+stripchart(rld$SV2 ~rld$cell_line,  
+           method = "jitter",       
+           pch = 19,          
+           col = 4,            
+           vertical = TRUE,      
+           add = TRUE)
+```
+
+
+##PCA after removingBatchEffect
+```{r}
+assay(rld) <- limma::removeBatchEffect(assay(rld), covariates=rld$SV1)
+assay(rld) <- limma::removeBatchEffect(assay(rld), covariates = rld$SV2)
+
+set.seed(1)
+(pca_data <- plotPCA(rld, intgroup = c("condition", "cell_line"), returnData=TRUE))
+percentVar <- round(100 * attr(pca_data, "percentVar"), digits=2)
+
+ggplot(pca_data, aes(PC1, PC2, color=condition, shape=cell_line)) + geom_point(size=3) +
+scale_x_continuous(paste0("PC1: ",percentVar[1],"% variance"), limits = c(-20,20)) +
+scale_y_continuous(paste0("PC2: ",percentVar[2],"% variance"), limits = c(-15, 10)) + 
+  ggtitle("PCA after correction")+ theme_classic() + geom_text(size= 3, data = pca_data, aes(PC1,PC2, label = name), hjust = 0.2)
+
+```
+
+```{r}
+sampleDists <- dist(t(assay(rld)))
+plot(hclust(sampleDists))
+```
+
+## Differential Expression
+
+```{r}
+#filter
+filter = apply(counts(ddssva, normalized=TRUE), 1, function(x){ mean(x) >= 1 })
+ddssva = ddssva[filter, ]
+
+ddssva <- estimateSizeFactors(ddssva) 
+ddssva <- estimateDispersions(ddssva)
+
+ddssva = nbinomLRT(ddssva, full= ~1 + cell_line + SV1 + SV2 + condition, reduced = ~ 1 + cell_line + SV1 + SV2)
+results.lrt = results(ddssva)
+cachectic_vs_control = results(ddssva, contrast=c("condition", "cachectic", "control"), independentFiltering = TRUE, alpha=0.1)
+cachectic_vs_control <- lfcShrink(ddssva,
+    coef = "condition_cachectic_vs_control", res=cachectic_vs_control, type = 'ashr')
+```
+
+### MA plot
+```{r}
+plotMA(cachectic_vs_control, colSig="red")
+```
+
+### Volcano plot
+
+Plotting volcano plots to visualise the differential expression 
+```{r}
+#volcano plots for differences between control and cachectic 
+par(mar=c(5,5,5,5), cex=1.0, cex.main=1.4, cex.axis=1.4, cex.lab=1.4)
+
+# Adjusted P values (FDR Q values)
+with(cachectic_vs_control, plot(log2FoldChange, -log10(padj), pch=20, main="Volcano plot of control vs. cachectic", cex=1.0, xlab=bquote(~Log[2]~fold~change), ylab=bquote(~-log[10]~padj~value) ) )
+
+with(subset(cachectic_vs_control, padj<0.1 & log2FoldChange> 1), points(log2FoldChange, -log10(padj), pch=20, col="red", cex=0.5))
+
+with(subset(cachectic_vs_control, padj<0.1 & log2FoldChange< -1), points(log2FoldChange, -log10(padj), pch=20, col="blue", cex=0.5))
+
+
+#Add lines for absolute FC>2 and P-value cut-off at FDR Q<0.1
+abline(v=0, col="black", lty=3, lwd=1.0)
+abline(v=-1, col="black", lty=4, lwd=2.0)
+abline(v=1, col="black", lty=4, lwd=2.0)
+abline(h=-log10(0.1), col="black", lty=4, lwd=2.0)
+
+legend("right", legend=c("Upregulated", "Downregulated", "Not"),fill= c("red", "blue", "black"))
+```
+
+
+## Clustering 
+
+So there are only two experimental conditions we care about in this analysis, however it would be good to visualise expression across the cell line, so lets plot a heatmap with two clusters (those upregulated and those downregulated)
+
+```{r}
+rld <- rlog(ddssva)
+
+assay(rld) <- limma::removeBatchEffect(assay(rld), covariates=rld$SV1)
+assay(rld) <- limma::removeBatchEffect(assay(rld), covariates = rld$SV2)
+
+significant_results=cachectic_vs_control[!is.na(cachectic_vs_control$padj) & cachectic_vs_control$padj<0.1,] ##10% are false positives. 
+rld_signif = assay(rld)[rownames(significant_results),]
+
+#how many genes are significantly different?
+nrow(rld_signif) #6465
+
+```
+
+```{r}
+rld_z = t(apply(rld_signif, 1, function(x){ (x - mean(x)) / sd(x)}))
+```
+
+```{r}
+thr = 3  ##threshold of 3 sd away 
+rld_z[rld_z > thr] = thr ## setting rld_z values > 3 as 3 
+rld_z[rld_z < -thr] = -thr ## setting rld_z values <-3 as -3 
+
+paletteLength = 20 ##making a pheatmap 
+breaksList <- c(seq(-thr, 0, length.out=ceiling(paletteLength/2) + 1), 
+              seq(thr/paletteLength, thr, length.out=floor(paletteLength/2)))
+
+# sort out colour scheme
+color = c(colorRampPalette(c("mediumblue", "white"))(14), colorRampPalette(c("white", "firebrick2"))(14))
+## from blue-->white--> brick red 
+breaksList = seq(-3, 3, length.out = 29)
+paletteLength = 20 ##making a pheatmap 
+breaksList <- c(seq(-thr, 0, length.out=ceiling(paletteLength/2) + 1), 
+              seq(thr/paletteLength, thr, length.out=floor(paletteLength/2)))
+
+color = c(colorRampPalette(c("mediumblue", "white"))(14), colorRampPalette(c("white", "firebrick2"))(14))
+## from blue-->white--> brick red 
+breaksList = seq(-3, 3, length.out = 29)
+```
+
+
+```{r}
+set.seed(2)
+nclust = 2
+results.coef.kmeans =  kmeans(rld_z, nclust, nstart=100, iter.max=50)
+results.coef = rld_z[order(results.coef.kmeans$cluster, decreasing=TRUE),]
+indicator = results.coef.kmeans$cluster[order(results.coef.kmeans$cluster)]  ## only want the cluster data
+table(indicator)
+
+heat.map <- pheatmap(results.coef, cluster_col=TRUE, breaks=breaksList, cluster_rows=FALSE, show_rownames=FALSE,color = color,fontsize_row = 3, legend=TRUE,border_color = NA, )
+```
+
+
+
+
+
+
+```{r}
+
+cachectic_vs_control.df = as.data.frame(cachectic_vs_control)
+cachectic_vs_control.df$mgi_symbol = bm.annotations$mgi_symbol[ match(row.names(cachectic_vs_control.df), bm.annotations$ensembl_gene_id) ]
+cachectic_vs_control.df$gene_biotype = bm.annotations$gene_biotype[ match(row.names(cachectic_vs_control.df), bm.annotations$ensembl_gene_id) ]
+cachectic_vs_control.df$description = bm.annotations$description[ match(row.names(cachectic_vs_control.df), bm.annotations$ensembl_gene_id) ]
+cachectic_vs_control.df$entrezgene_id = bm.annotations$entrezgene_id[ match(row.names(cachectic_vs_control.df), bm.annotations$ensembl_gene_id) ]
+cachectic_vs_control.df$cluster = NA
+cachectic_vs_control.df[names(results.coef.kmeans$cluster),]$cluster = ifelse(results.coef.kmeans$cluster==2, "UP", "DOWN")
+
+write.csv(cachectic_vs_control.df, "./results/talbert_mouse_df.csv")
+
+```
+
+
+## Functional enrichments  
+Annotating the clusters with the terms/processes/pathways that they are enriched with. Do these annotations make sense given the patterns in the clusters? Remember that clustering ordering changes between runs so make sure to remember to saveRDS and readRDS.
+
+### CLUSTER 1
+
+```{r}
+c1 = row.names(cachectic_vs_control.df[!is.na(cachectic_vs_control.df$cluster) & cachectic_vs_control.df$cluster=="UP",])
+
+heat.map.c1 <- pheatmap(results.coef[c1,], cluster_col=TRUE, breaks=breaksList, cluster_rows=FALSE, show_rownames=FALSE,color = color,fontsize_row = 3, legend=TRUE,border_color = NA, main = "Cluster 1")
+
+```
+
+```{r}
+ego.BP_c1 <- enrichGO(gene    = c1,
+                universe      = rownames(dds), 
+                OrgDb         = org.Mm.eg.db,  
+                keyType       = 'ENSEMBL',
+                ont           = "BP", 
+                pAdjustMethod = "BH", 
+                pvalueCutoff  = 1,
+                qvalueCutoff  = 1,
+                readable      = TRUE)
+
+write.csv(as.data.frame(ego.BP_c1), "./results/go_bp_up.csv")
+saveRDS(ego.BP_c1, "rds/ego.BP_up.rds")
+dotplot(ego.BP_c1, title="GO:BP Cluster 1")
+```
+
+```{r}
+ego.MF_c1 <- enrichGO(gene          = c1,
+                universe      = rownames(dds), 
+                OrgDb         = org.Mm.eg.db, 
+                keyType       = 'ENSEMBL', 
+                ont           = "MF", 
+                pAdjustMethod = "BH", 
+                pvalueCutoff  = 1,
+                qvalueCutoff  = 1,
+        readable      = TRUE)
+
+write.csv(as.data.frame(ego.MF_c1), "./results/go_mf_up.csv")
+saveRDS(ego.MF_c1, "rds/ego.MF_up.rds")
+dotplot(ego.MF_c1, title="GO:MF Cluster 1")
+```
+
+```{r}
+ego.CC_c1 <- enrichGO(gene          = c1,
+                universe      = rownames(dds),
+                OrgDb         = org.Mm.eg.db,  
+                keyType       = 'ENSEMBL',  
+                ont           = "CC", 
+                pAdjustMethod = "BH", 
+                pvalueCutoff  = 1,
+                qvalueCutoff  = 1,
+        readable      = TRUE)
+
+write.csv(as.data.frame(ego.CC_c1), "./results/go_cc_up.csv")
+saveRDS(ego.CC_c1, "rds/ego.CC_up.rds")
+dotplot(ego.CC_c1, title="GO:CC Cluster 1")
+```
+
+## KEGG Analysis 
+```{r}
+kegg_c1 <- enrichKEGG( gene= as.character(ensembl.genes[c1,]$entrezgene_id),
+                      universe = as.character(ensembl.genes[rownames(dds),]$entrezgene_id), 
+                      organism = 'mmu' ,
+                      pvalueCutoff = 1,
+                      qvalueCutoff = 1)
+
+write.csv(as.data.frame(kegg_c1), "./results/kegg_up.csv")
+saveRDS(kegg_c1, "rds/KEGG_up.rds")
+dotplot(kegg_c1, title= "KEGG Cluster 1")
+```
+
+
+
+### CLUSTER 2 
+
+```{r}
+c2 = row.names(cachectic_vs_control.df[!is.na(cachectic_vs_control.df$cluster) & cachectic_vs_control.df$cluster=="DOWN",])
+
+
+heat.map.c2 <- pheatmap(results.coef[c2,], cluster_col=TRUE, breaks=breaksList, cluster_rows=FALSE, show_rownames=FALSE,color = color,fontsize_row = 3, legend=TRUE,border_color = NA, main = "Cluster 2")
+
+```
+
+```{r}
+ego.BP_c2 <- enrichGO(gene    = c2,
+                universe      = rownames(dds), 
+                OrgDb         = org.Mm.eg.db,  
+                keyType       = 'ENSEMBL',  
+                ont           = "BP", 
+                pAdjustMethod = "BH", 
+                pvalueCutoff  = 1,
+                qvalueCutoff  = 1,
+        readable      = TRUE)
+
+write.csv(as.data.frame(ego.BP_c2), "./results/go_bp_dn.csv")
+saveRDS(ego.BP_c2, "rds/ego.BP_dn.rds")
+dotplot(ego.BP_c2, title="GO:BP Cluster 2")
+```
+
+```{r}
+ego.MF_c2 <- enrichGO(gene    = c2,
+                universe      = rownames(dds), 
+                OrgDb         = org.Mm.eg.db,  
+                keyType       = 'ENSEMBL',  
+                ont           = "MF", 
+                pAdjustMethod = "BH", 
+                pvalueCutoff  = 1,
+                qvalueCutoff  = 1,
+        readable      = TRUE)
+
+write.csv(as.data.frame(ego.MF_c2), "./results/go_mf_dn.csv")
+saveRDS(ego.MF_c2, "rds/ego.MF_dn.rds")
+dotplot(ego.MF_c2, title="GO:MF Cluster 2")
+```
+
+```{r}
+ego.CC_c2 <- enrichGO(gene    = c2,
+                universe      = rownames(dds), 
+                OrgDb         = org.Mm.eg.db, 
+                keyType       = 'ENSEMBL',  
+                ont           = "CC", 
+                pAdjustMethod = "BH", 
+                pvalueCutoff  = 1,
+                qvalueCutoff  = 1,
+                readable      = TRUE)
+
+saveRDS(ego.CC_c2, "rds/ego.CC_dn.rds")
+write.csv(as.data.frame(ego.CC_c2), "./results/go_cc_dn.csv")
+dotplot(ego.CC_c2, title="GO:CC Cluster 2")
+```
+
+```{r}
+kegg_c2 <- enrichKEGG( gene= as.character(ensembl.genes[c2,]$entrezgene_id),
+                      universe = as.character(ensembl.genes[rownames(dds),]$entrezgene_id),
+                      organism = 'mmu' ,
+                      pvalueCutoff=1,
+                      qvalueCutoff =1)
+
+write.csv(as.data.frame(kegg_c2), "./results/kegg_dn.csv")
+saveRDS(kegg_c2, "rds/KEGG_dn.rds")
+dotplot(kegg_c2, title= "KEGG Cluster 2")
+```
+
+
+## Functional enrichment plots 
+
+
+```{r, eval=FALSE}
+test <- simplify(ego.BP_c1, cutoff=0.7, by="qvalue", select_fun= min, measure="Wang")
+```
+
+```{r}
+library(stringr)
+up.terms = rbind(
+  ego.BP_c1[ego.BP_c1$Description %in% c("mRNA processing", "ribosome biogenesis", "regulation of apoptotic signaling pathway", "muscle cell proliferation"),
+            c("ID", "Description", "GeneRatio", "BgRatio", "pvalue", "p.adjust", "qvalue")], 
+  ego.MF_c1[ego.MF_c1$Description %in% c("RNA polymerase II-specific DNA-binding transcription factor binding", "structural constituent of ribosome"),
+            c("ID", "Description", "GeneRatio", "BgRatio", "pvalue", "p.adjust", "qvalue")],
+  kegg_c1[kegg_c1$Description %in% c("HIF-1 signaling pathway - Mus musculus (house mouse)", "Mitophagy - animal - Mus musculus (house mouse)", "Notch signaling pathway - Mus musculus (house mouse)"),
+          c("ID", "Description", "GeneRatio", "BgRatio", "pvalue", "p.adjust", "qvalue")]
+  )
+
+up.terms$ontology = c(rep("GO:BP", 4), rep("GO:MF", 2), rep("KEGG", 3))
+up.terms$count = sapply(str_split(up.terms$GeneRatio, "/"), function(x){ as.numeric(x[1])})
+up.terms$gr = sapply(str_split(up.terms$GeneRatio, "/"), function(x){ as.numeric(x[1])/as.numeric(x[2])})
+
+up.terms$bgr = sapply(str_split(up.terms$BgRatio, "/"), function(x){ as.numeric(x[1])/as.numeric(x[2])})
+up.terms$bg = sapply(str_split(up.terms$BgRatio, "/"), function(x){ as.numeric(x[1])})
+up.terms$gb = up.terms$count / up.terms$bg
+up.terms$category = "UP"
+
+down.terms = rbind(
+  ego.BP_c2[ego.BP_c2$Description %in% c("muscle cell differentiation", "collagen fibril organization", "tricarboxylic acid cycle", "response to oxygen levels"),
+            c("ID", "Description", "GeneRatio", "pvalue", "p.adjust", "qvalue", "BgRatio")],
+  ego.CC_c2[ego.CC_c2$Description %in% c("myofibril", "respirasome"),
+            c("ID", "Description", "BgRatio", "GeneRatio", "pvalue", "p.adjust", "qvalue")],
+  kegg_c2[kegg_c2$Description %in% c("Oxidative phosphorylation - Mus musculus (house mouse)", "Cardiac muscle contraction - Mus musculus (house mouse)", "Focal adhesion - Mus musculus (house mouse)"),
+          c("ID", "Description", "GeneRatio", "BgRatio", "pvalue", "p.adjust", "qvalue")]
+  )
+
+down.terms$ontology = c(rep("GO:BP", 4), rep("GO:CC", 2), rep("KEGG", 3))
+down.terms$count = sapply(str_split(down.terms$GeneRatio, "/"), function(x){ as.numeric(x[1])})
+down.terms$gr = sapply(str_split(down.terms$GeneRatio, "/"), function(x){ as.numeric(x[1])/as.numeric(x[2])})
+down.terms$bgr = sapply(str_split(down.terms$BgRatio, "/"), function(x){ as.numeric(x[1])/as.numeric(x[2])})
+down.terms$bg = sapply(str_split(down.terms$BgRatio, "/"), function(x){ as.numeric(x[1])})
+down.terms$gb = down.terms$count / down.terms$bg
+down.terms$category = "DOWN"
+
+terms.to.plot = rbind(up.terms, down.terms)
+
+terms.to.plot$Description = factor(terms.to.plot$Description,
+                                   rev(c("mRNA processing", 
+                                         "ribosome biogenesis", 
+                                         "regulation of apoptotic signaling pathway", 
+                                         "muscle cell proliferation", 
+                                         "RNA polymerase II-specific DNA-binding transcription factor binding", 
+                                         "structural constituent of ribosome", 
+                                         "HIF-1 signaling pathway - Mus musculus (house mouse)", 
+                                         "Mitophagy - animal - Mus musculus (house mouse)", 
+                                         "Notch signaling pathway - Mus musculus (house mouse)",
+                                         "muscle cell differentiation", 
+                                         "collagen fibril organization", 
+                                         "tricarboxylic acid cycle", 
+                                         "response to oxygen levels", 
+                                         "myofibril", "respirasome", 
+                                         "Oxidative phosphorylation - Mus musculus (house mouse)", 
+                                         "Cardiac muscle contraction - Mus musculus (house mouse)", 
+                                         "Focal adhesion - Mus musculus (house mouse)")))
+
+ggplot(terms.to.plot, aes(x=gb, y=Description, size=count, colour=qvalue)) + geom_point() + scale_x_continuous("Fraction of annotated genes", limits=c(0, 1)) + theme_bw() + scale_color_continuous(limits=c(0, 0.05), high="blue", low="red") + facet_grid(~category)
+
+  ggplot(terms.to.plot, aes(x=gr, y=Description, size=count, colour=qvalue)) + geom_point() + scale_x_continuous("Gene Ratio", limits=c(0, 0.1)) + theme_bw() + scale_color_continuous(limits=c(0, 0.05), high="blue", low="red") + facet_grid(~category)
+  
+  
+```
+
+## Mef2c gene expression plot {.tabset}
+
+```{r}
+
+genes_plot <- data.frame(
+  model = ddssva$cell_line,
+  condition = ddssva$condition,
+  expression = counts(ddssva, normalized = TRUE)[c("ENSMUSG00000005583"), ])
+
+
+genes_plot %>%
+  ggplot(aes(x = condition, y = expression, group = condition, fill=condition)) + 
+  geom_boxplot() +
+  #geom_text(aes(label=round(value,2)), vjust=-0.3, size=3.5) + 
+  xlab("Samples") +
+  ylab("Normalised Counts") +
+  theme_bw() +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank()) +
+  geom_point(data=genes_plot, aes(x=condition, y=expression, group=condition), size=2) + scale_y_continuous(limits=c(5000, 25000)) + facet_grid(~model)
+
+```
+
+
+
+```{r}
+saveRDS(ddssva,  "rds/ddssva.rds")
+
+```
+
+
+```{r}
+sessionInfo()
+```
